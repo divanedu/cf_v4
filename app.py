@@ -1723,9 +1723,10 @@ def classify_uploads(uploads) -> Dict[str, object]:
 
 
 st.markdown("#### Загрузка")
+upload_types = ["xlsx", "xlsm"] + (["xls"] if os.name == "nt" else [])
 uploads = st.file_uploader(
     "Загрузите файлы Excel",
-    type=["xlsx", "xlsm", "xls"],
+    type=upload_types,
     accept_multiple_files=True,
     label_visibility="collapsed",
     key="uploads",
@@ -1733,6 +1734,9 @@ uploads = st.file_uploader(
 
 if not uploads:
     st.stop()
+
+if os.name != "nt":
+    st.caption(".xls на Streamlit Cloud (Linux) не поддерживается. Используй .xlsx/.xlsm или запускай локально на Windows для авто-конвертации.")
 
 if any(is_xls_filename(u.name) for u in uploads):
     st.info("Обнаружены .xls. Перед обработкой они будут конвертированы в .xlsx через установленный Microsoft Excel (может занять время).")
