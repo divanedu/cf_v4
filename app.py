@@ -1215,9 +1215,14 @@ def run_code_2(file_bytes: bytes) -> bytes:
     if not valid_prefixes:
         raise ValueError("Код 2: не найдено пар листов (Wd/Md) по префиксам.")
 
+    source_sheets_to_delete = set()
     for prefix in valid_prefixes:
-        md_ws = wb[prefix_to_pair[prefix]["md"]]
-        wd_ws = wb[prefix_to_pair[prefix]["wd"]]
+        md_name = prefix_to_pair[prefix]["md"]
+        wd_name = prefix_to_pair[prefix]["wd"]
+        md_ws = wb[md_name]
+        wd_ws = wb[wd_name]
+        source_sheets_to_delete.add(md_name)
+        source_sheets_to_delete.add(wd_name)
 
         payments_year = defaultdict(lambda: [0.0, 0.0, 0.0])
         performance_year = defaultdict(lambda: [0.0, 0.0, 0.0])
@@ -1388,6 +1393,11 @@ def run_code_2(file_bytes: bytes) -> bytes:
                     top=cell.border.top,
                     bottom=cell.border.bottom,
                 )
+
+    # After building the contract sheet(s), drop source Wd/Md sheets from the output file.
+    for sh in sorted(source_sheets_to_delete):
+        if sh in wb.sheetnames:
+            del wb[sh]
 
     out = io.BytesIO()
     wb.save(out)
