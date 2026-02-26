@@ -5,7 +5,7 @@ import os
 import tempfile
 from copy import copy as _copy
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -219,6 +219,73 @@ def copy_sheet(src_ws, dst_wb, new_title: str):
     return dst_ws
 
 
+def excel_col_width_from_pixels(px: float) -> float:
+    # Approximation for Excel default font metrics.
+    # Common mapping: pixels ~= width*7 + 5  => width ~= (px-5)/7
+    try:
+        px = float(px)
+    except Exception:
+        px = 48.0
+    return max(0.0, round((px - 5.0) / 7.0, 2))
+
+
+def set_all_columns_width(ws, px: float):
+    width = excel_col_width_from_pixels(px)
+    max_col = ws.max_column or 1
+    # Safety cap in case max_column is corrupted by formatting.
+    max_col = min(max_col, 2000)
+    for i in range(1, max_col + 1):
+        col = get_column_letter(i)
+        dim = ws.column_dimensions[col]
+        dim.width = width
+
+
+REGISTRY_COL_WIDTH_PX = 48.0
+# Excel row height uses points. User requirement: fixed height (no auto-growth).
+REGISTRY_ROW_HEIGHT_PT = 28.8
+
+
+def format_registry_sheet(ws) -> None:
+    """
+    Реестр (Wr/Mr): фиксируем ширину всех колонок и высоту всех строк,
+    чтобы Excel не "раздувал" строки из-за wrap_text.
+    """
+    set_all_columns_width(ws, REGISTRY_COL_WIDTH_PX)
+    try:
+        ws.sheet_format.defaultRowHeight = REGISTRY_ROW_HEIGHT_PT
+    except Exception:
+        pass
+
+    rows: Set[int] = set(getattr(ws, "row_dimensions", {}).keys())
+    for (r, _c), cell in getattr(ws, "_cells", {}).items():
+        rows.add(int(r))
+        # Force no wrapping to avoid row auto-growth in Excel UI.
+        try:
+            al = cell.alignment
+            if al and getattr(al, "wrap_text", None):
+                cell.alignment = Alignment(
+                    horizontal=al.horizontal,
+                    vertical=al.vertical,
+                    textRotation=al.textRotation,
+                    wrapText=False,
+                    shrinkToFit=al.shrinkToFit,
+                    indent=al.indent,
+                    relativeIndent=al.relativeIndent,
+                    justifyLastLine=al.justifyLastLine,
+                    readingOrder=al.readingOrder,
+                )
+        except Exception:
+            pass
+
+    # Set explicit height for rows that exist in dimensions or have cells.
+    # (Avoid iterating 1..max_row for speed.)
+    for r in rows:
+        try:
+            ws.row_dimensions[r].height = REGISTRY_ROW_HEIGHT_PT
+        except Exception:
+            pass
+
+
 def merge_wh_m_into_analysis(analysis_wb, wh_bytes: Optional[bytes], wh_name: str, m_bytes: Optional[bytes], m_name: str) -> Dict[str, List[str]]:
     report = {"missing_wh": [], "missing_m": [], "copied": []}
 
@@ -235,7 +302,9 @@ def merge_wh_m_into_analysis(analysis_wb, wh_bytes: Optional[bytes], wh_name: st
                 report["missing_m"].append(src_title)
                 continue
             new_title = make_unique_sheet_title(analysis_wb, dst_title)
-            copy_sheet(m_wb[src_title], analysis_wb, new_title)
+            dst_ws = copy_sheet(m_wb[src_title], analysis_wb, new_title)
+            if dst_title.lower() == "mr":
+                format_registry_sheet(dst_ws)
             report["copied"].append(f"{m_name}:{src_title} -> {new_title}")
 
     if wh_bytes:
@@ -251,7 +320,9 @@ def merge_wh_m_into_analysis(analysis_wb, wh_bytes: Optional[bytes], wh_name: st
                 report["missing_wh"].append(src_title)
                 continue
             new_title = make_unique_sheet_title(analysis_wb, dst_title)
-            copy_sheet(wh_wb[src_title], analysis_wb, new_title)
+            dst_ws = copy_sheet(wh_wb[src_title], analysis_wb, new_title)
+            if dst_title.lower() == "wr":
+                format_registry_sheet(dst_ws)
             report["copied"].append(f"{wh_name}:{src_title} -> {new_title}")
 
         if "Кредиты" in wh_wb.sheetnames:
@@ -281,8 +352,7 @@ def merge_wh_m_into_analysis_with_prefix(
 
     if m_bytes:
         m_wb, _ = load_wb_from_bytes(m_bytes, m_name)
-        # "Реестр" больше не копируем (Mr/Wr не должно быть).
-        mapping_m = {"Итог": "M", "Контрагенты": "Mt", "Договоры": "Md"}
+        mapping_m = {"Итог": "M", "Контрагенты": "Mt", "Реестр": "Mr", "Договоры": "Md"}
         for src_title, base in mapping_m.items():
             if src_title not in m_wb.sheetnames:
                 report["missing_m"].append(src_title)
@@ -291,13 +361,14 @@ def merge_wh_m_into_analysis_with_prefix(
             # Keep Md suffix intact for contracts pairing.
             if base.lower().endswith("md"):
                 new_title = make_unique_with_fixed_suffix(analysis_wb, p + base[:-2], "Md")
-            copy_sheet(m_wb[src_title], analysis_wb, new_title)
+            dst_ws = copy_sheet(m_wb[src_title], analysis_wb, new_title)
+            if base.lower() == "mr":
+                format_registry_sheet(dst_ws)
             report["copied"].append(f"{m_name}:{src_title} -> {new_title}")
 
     if wh_bytes:
         wh_wb, _ = load_wb_from_bytes(wh_bytes, wh_name)
-        # "Реестр" больше не копируем (Mr/Wr не должно быть).
-        mapping_wh = {"Итог": "W", "Таблицы": "Wt", "Договоры": "Wd"}
+        mapping_wh = {"Итог": "W", "Таблицы": "Wt", "Реестр": "Wr", "Договоры": "Wd"}
         for src_title, base in mapping_wh.items():
             if src_title not in wh_wb.sheetnames:
                 report["missing_wh"].append(src_title)
@@ -305,7 +376,9 @@ def merge_wh_m_into_analysis_with_prefix(
             new_title = make_unique_sheet_title(analysis_wb, f"{p}{base}")
             if base.lower().endswith("wd"):
                 new_title = make_unique_with_fixed_suffix(analysis_wb, p + base[:-2], "Wd")
-            copy_sheet(wh_wb[src_title], analysis_wb, new_title)
+            dst_ws = copy_sheet(wh_wb[src_title], analysis_wb, new_title)
+            if base.lower() == "wr":
+                format_registry_sheet(dst_ws)
             report["copied"].append(f"{wh_name}:{src_title} -> {new_title}")
 
         if "Кредиты" in wh_wb.sheetnames:
@@ -893,14 +966,33 @@ def build_analysis_workbook(
     osv_files: List[Tuple[str, bytes]],
     analysis_name_for_new: str,
     osv_prefix_by_sheet: Optional[Dict[Tuple[str, str], str]] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> Tuple[bytes, str, Dict[str, object], Dict[str, List[str]]]:
     report: Dict[str, List[str]] = {"warnings": [], "copied": []}
+
+    def _progress(frac: float, msg: str) -> None:
+        if progress_cb:
+            try:
+                progress_cb(max(0.0, min(1.0, float(frac))), msg)
+            except Exception:
+                pass
+
+    total_steps = 2 + (1 if analysis_file else 0) + len(wh_files) + len(m_files) + len(osv_files)
+    done_steps = 0
+
+    def _step(msg: str) -> None:
+        nonlocal done_steps
+        done_steps += 1
+        _progress(done_steps / max(1, total_steps), f"Сборка ({done_steps}/{total_steps}): {msg}")
+
+    _progress(0.0, "Сборка: старт…")
 
     if analysis_file:
         analysis_name, analysis_bytes = analysis_file
         analysis_wb, keep_vba = load_wb_from_bytes(analysis_bytes, analysis_name)
         out_name = analysis_name
         placeholder_title = None
+        _step(f"Открываю {analysis_name}")
     else:
         analysis_wb = Workbook()
         # Keep a visible placeholder sheet so saving never fails with
@@ -912,6 +1004,7 @@ def build_analysis_workbook(
         keep_vba = False
         base = (analysis_name_for_new or "").strip()
         out_name = safe_filename(f"_Анализ {base}".strip() + ".xlsx")
+        _step("Создаю новый _Анализ")
 
     if wh_files or m_files:
         missing_wh_all: List[str] = []
@@ -921,11 +1014,13 @@ def build_analysis_workbook(
             merge_report = merge_wh_m_into_analysis_with_prefix(analysis_wb, wh_bytes, wh_name, None, "", prefix=pref)
             missing_wh_all.extend([f"{wh_name}:{x}" for x in merge_report["missing_wh"]])
             report["copied"].extend(merge_report["copied"])
+            _step(f"WH_KZ: {wh_name} (листов: {len(merge_report.get('copied') or [])})")
 
         for m_name, m_bytes, pref in m_files:
             merge_report = merge_wh_m_into_analysis_with_prefix(analysis_wb, None, "", m_bytes, m_name, prefix=pref)
             missing_m_all.extend([f"{m_name}:{x}" for x in merge_report["missing_m"]])
             report["copied"].extend(merge_report["copied"])
+            _step(f"M_KZ: {m_name} (листов: {len(merge_report.get('copied') or [])})")
 
         if missing_wh_all or missing_m_all:
             msg = []
@@ -940,6 +1035,7 @@ def build_analysis_workbook(
         # We need per-account prefix control for saldo accounts to avoid collisions while keeping suffixes intact.
         report_local = {"added": [], "skipped": []}
         for fname, fbytes in osv_files:
+            _step(f"ОСВ: очищаю {fname}")
             osv_wb, _ = load_wb_from_bytes(fbytes, fname)
             for ws in osv_wb.worksheets:
                 clear_outline_for_sheet(ws)
@@ -982,6 +1078,7 @@ def build_analysis_workbook(
 
     availability = compute_availability_from_wb(analysis_wb)
 
+    _step("Сохраняю файл…")
     out = io.BytesIO()
     analysis_wb.save(out)
     return out.getvalue(), out_name, availability, report
@@ -1008,6 +1105,49 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
     if not prefix_to_sheets:
         raise ValueError("Код 1: не найдено листов, заканчивающихся на 1210/1710/3310/3510.")
+
+    def _excel_sheet_ref(sheet_name: str) -> str:
+        # Quote if needed and escape apostrophes (Excel style).
+        if sheet_name is None:
+            return "''"
+        s = str(sheet_name)
+        needs = any(ch in s for ch in " []()!,'\"") or (" " in s)
+        if "'" in s:
+            s = s.replace("'", "''")
+            needs = True
+        return f"'{s}'" if needs else s
+
+    def _find_prefixed_sheetname(prefix_norm: str, base2: str) -> Optional[str]:
+        """
+        Finds sheet like: "<prefix>Wr" / "<prefix>Mr" (case-insensitive),
+        optionally with " (n)" suffix. Returns the best candidate or None.
+        """
+        base2_l = base2.lower()
+        best = None
+        best_key = None
+        for name in wb.sheetnames:
+            nm = str(name)
+            nm2 = re.sub(r"\s*\(\d+\)$", "", nm).strip()
+            if not nm2.lower().endswith(base2_l):
+                continue
+            pref_part = nm2[: -len(base2_l)]
+            if normalize_prefix(pref_part) != prefix_norm:
+                continue
+            m = re.search(r"\((\d+)\)\s*$", nm)
+            n = int(m.group(1)) if m else 0
+            key = (1 if m else 0, n, len(nm))  # prefer exact name without (n)
+            if best is None or key < best_key:
+                best = nm
+                best_key = key
+        return best
+
+    def _top15_pos_neg(df: pd.DataFrame, col: str) -> pd.DataFrame:
+        if df is None or df.empty or col not in df.columns:
+            return df.iloc[0:0].copy()
+        pos = df[df[col] > 0].nlargest(15, col) if (df[col] > 0).any() else df.iloc[0:0]
+        neg = df[df[col] < 0].nsmallest(15, col) if (df[col] < 0).any() else df.iloc[0:0]
+        out = pd.concat([pos, neg], ignore_index=True)
+        return out.reset_index(drop=True)
 
     for prefix, suf_map in prefix_to_sheets.items():
         sheet_data = {}
@@ -1190,6 +1330,225 @@ def run_code_1(file_bytes: bytes) -> bytes:
             col_total_saldo
         ]:
             ws.column_dimensions[get_column_letter(col)].width = WIDTH_NUM
+
+        # =========================
+        # Sheet "сальд (2)" — Top 15 + / Top 15 - with month formulas
+        # =========================
+        out2_name = safe_sheet_name(f"{prefix}сальд (2)" if prefix else "сальд (2)")
+        if out2_name in wb.sheetnames:
+            wb.remove(wb[out2_name])
+        ws2 = wb.create_sheet(out2_name)
+
+        ws2["A1"] = "Все значения указаны в тысячах тенге"
+        ws2["A1"].font = Font(name="Arial", size=10, bold=True)
+
+        font_h = Font(name="Arial", size=10, bold=True)
+        font_b = Font(name="Arial", size=10)
+        font_bb = Font(name="Arial", size=10, bold=True)
+        align_c = Alignment(horizontal="center")
+        align_l = Alignment(horizontal="left")
+        num_fmt = "#,##0;[Red](#,##0)"
+
+        # A2 = 6, left + soft gray fill
+        ws2["A2"] = 6
+        ws2["A2"].alignment = Alignment(horizontal="left")
+        ws2["A2"].fill = PatternFill("solid", fgColor="D9D9D9")
+
+        ws2["F2"] = "коммент"
+
+        # Use & concatenation to avoid Excel adding implicit-intersection "@"
+        ws2["G2"] = '="Опл L"&$A$2&"M"'
+        ws2["H2"] = '="Вып L"&$A$2&"M"'
+
+        ws2["P1"] = "Оплаты"
+        ws2["AO1"] = "Выполнения"
+        ws2["P1"].font = font_h
+        ws2["AO1"].font = font_h
+
+        # Month headers
+        months = [f"2025_{m:02d}" for m in range(1, 13)] + [f"2026_{m:02d}" for m in range(1, 13)]
+        for i, m in enumerate(months):
+            ws2.cell(row=2, column=10 + i, value=m).font = font_h  # J..AG
+            ws2.cell(row=2, column=10 + i, value=m).alignment = align_c
+            ws2.cell(row=2, column=35 + i, value=m).font = font_h  # AI..BF
+            ws2.cell(row=2, column=35 + i, value=m).alignment = align_c
+
+        # Table headers
+        ws2["B2"] = "Контрагент"
+        ws2["C2"] = "1210"
+        ws2["D2"] = "3510"
+        ws2["E2"] = "сальдо с заказчиками"
+        for c in ("B2", "C2", "D2", "E2", "F2", "G2", "H2"):
+            ws2[c].font = font_h
+            ws2[c].alignment = align_c if c != "B2" else align_l
+
+        ws2["B34"] = "Контрагент"
+        ws2["C34"] = "1710"
+        ws2["D34"] = "3310"
+        ws2["E34"] = "сальдо с поставщиками"
+        for c in ("B34", "C34", "D34", "E34"):
+            ws2[c].font = font_h
+            ws2[c].alignment = align_c if c != "B34" else align_l
+
+        total_header_row = 66
+        ws2[f"B{total_header_row}"] = "Контрагент"
+        ws2[f"E{total_header_row}"] = "общее сальдо"
+        ws2[f"B{total_header_row}"].font = font_h
+        ws2[f"E{total_header_row}"].font = font_h
+        ws2[f"B{total_header_row}"].alignment = align_l
+        ws2[f"E{total_header_row}"].alignment = align_c
+
+        # Pick Wr/Mr per prefix (if present) for formulas
+        pref_norm = normalize_prefix(prefix)
+        wr_name = _find_prefixed_sheetname(pref_norm, "Wr") or (f"{prefix}Wr" if prefix else "Wr")
+        mr_name = _find_prefixed_sheetname(pref_norm, "Mr") or (f"{prefix}Mr" if prefix else "Mr")
+        wr_ref = _excel_sheet_ref(wr_name)
+        mr_ref = _excel_sheet_ref(mr_name)
+
+        # Top 15 + / Top 15 - blocks
+        df_c2 = _top15_pos_neg(df_cust, "сальдо заказчики")
+        df_s2 = _top15_pos_neg(df_supp, "сальдо поставщики")
+        df_t2 = _top15_pos_neg(df_total, "общее сальдо")
+
+        def _write_rows(df: pd.DataFrame, start_row: int, kind: str) -> None:
+            """
+            kind: 'cust'|'supp'|'total'
+            Writes up to 30 rows into B..E and adds formulas for G/H and month blocks where requested.
+            """
+            for i in range(30):
+                r = start_row + i
+                if df is None or i >= len(df.index):
+                    continue
+                row = df.iloc[i]
+                contr = str(row.get("Контрагент", "")).strip()
+                if not contr:
+                    continue
+
+                ws2.cell(row=r, column=2, value=contr).font = font_b
+                ws2.cell(row=r, column=2).alignment = align_l
+
+                if kind == "cust":
+                    v1210 = int(round(float(row.get("1210", 0) or 0)))
+                    v3510 = int(round(float(row.get("3510", 0) or 0)))
+                    vsaldo = int(round(float(row.get("сальдо заказчики", 0) or 0)))
+                    ws2.cell(row=r, column=3, value=v1210).number_format = num_fmt
+                    ws2.cell(row=r, column=4, value=v3510).number_format = num_fmt
+                    ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
+                    ws2.cell(row=r, column=3).font = font_b
+                    ws2.cell(row=r, column=4).font = font_b
+                    ws2.cell(row=r, column=5).font = font_bb
+                    for c in (3, 4, 5):
+                        ws2.cell(row=r, column=c).alignment = align_c
+
+                elif kind == "supp":
+                    v1710 = int(round(float(row.get("1710", 0) or 0)))
+                    v3310 = int(round(float(row.get("3310", 0) or 0)))
+                    vsaldo = int(round(float(row.get("сальдо поставщики", 0) or 0)))
+                    ws2.cell(row=r, column=3, value=v1710).number_format = num_fmt
+                    ws2.cell(row=r, column=4, value=v3310).number_format = num_fmt
+                    ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
+                    ws2.cell(row=r, column=3).font = font_b
+                    ws2.cell(row=r, column=4).font = font_b
+                    ws2.cell(row=r, column=5).font = font_bb
+                    for c in (3, 4, 5):
+                        ws2.cell(row=r, column=c).alignment = align_c
+
+                else:  # total
+                    vtot = int(round(float(row.get("общее сальдо", 0) or 0)))
+                    ws2.cell(row=r, column=5, value=vtot).number_format = num_fmt
+                    ws2.cell(row=r, column=5).font = font_bb
+                    ws2.cell(row=r, column=5).alignment = align_c
+
+                # G/H rollups (only for customers/suppliers blocks; not for total block)
+                if kind != "total":
+                    ws2.cell(
+                        row=r,
+                        column=7,
+                        value=(
+                            f'=IF($B{r}="","",SUM('
+                            f'INDEX($J{r}:$AG{r},1,MAX(1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$J$2:$AG$2,0),COUNTA($J$2:$AG$2))-$A$2+1)):'
+                            f'INDEX($J{r}:$AG{r},1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$J$2:$AG$2,0),COUNTA($J$2:$AG$2)))))'
+                        ),
+                    ).alignment = align_c
+                    ws2.cell(row=r, column=7).font = font_b
+                    ws2.cell(row=r, column=7).number_format = num_fmt
+
+                    ws2.cell(
+                        row=r,
+                        column=8,
+                        value=(
+                            f'=IF($B{r}="","",SUM('
+                            f'INDEX($AI{r}:$BF{r},1,MAX(1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$AI$2:$BF$2,0),COUNTA($AI$2:$BF$2))-$A$2+1)):'
+                            f'INDEX($AI{r}:$BF{r},1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$AI$2:$BF$2,0),COUNTA($AI$2:$BF$2)))))'
+                        ),
+                    ).alignment = align_c
+                    ws2.cell(row=r, column=8).font = font_b
+                    ws2.cell(row=r, column=8).number_format = num_fmt
+
+                # Month formulas
+                if kind == "cust":
+                    # J..AG payments from Wr
+                    for ci in range(10, 34):  # J..AG
+                        col_letter = get_column_letter(ci)
+                        ws2.cell(
+                            row=r,
+                            column=ci,
+                            value=(
+                                f'=IF($B{r}="","",'
+                                f'SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,\"1210\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
+                                f'+SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,\"3510\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
+                                f')'
+                            ),
+                        ).number_format = num_fmt
+                        ws2.cell(row=r, column=ci).alignment = align_c
+
+                    # AI..AT (2025) *1.12, AU..BF (2026) *1.16 from Mr
+                    for ci in range(35, 47):  # AI..AT
+                        col_letter = get_column_letter(ci)
+                        ws2.cell(
+                            row=r,
+                            column=ci,
+                            value=(
+                                f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Q:$Q,$B{r},{mr_ref}!$G:$G,\"6010\")*1.12)'
+                            ),
+                        ).number_format = num_fmt
+                        ws2.cell(row=r, column=ci).alignment = align_c
+
+                    for ci in range(47, 59):  # AU..BF
+                        col_letter = get_column_letter(ci)
+                        ws2.cell(
+                            row=r,
+                            column=ci,
+                            value=(
+                                f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Q:$Q,$B{r},{mr_ref}!$G:$G,\"6010\")*1.16)'
+                            ),
+                        ).number_format = num_fmt
+                        ws2.cell(row=r, column=ci).alignment = align_c
+
+                elif kind == "supp":
+                    for ci in range(10, 34):  # J..AG
+                        col_letter = get_column_letter(ci)
+                        ws2.cell(
+                            row=r,
+                            column=ci,
+                            value=(
+                                f'=IF($B{r}="","",'
+                                f'SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,\"1710\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
+                                f'+SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,\"3310\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
+                                f')'
+                            ),
+                        ).number_format = num_fmt
+                        ws2.cell(row=r, column=ci).alignment = align_c
+
+        _write_rows(df_c2, start_row=3, kind="cust")
+        _write_rows(df_s2, start_row=35, kind="supp")
+        _write_rows(df_t2, start_row=67, kind="total")
+
+        # Minimal widths for readability
+        ws2.column_dimensions["A"].width = 6
+        ws2.column_dimensions["B"].width = 35
+        for col in ["C", "D", "E", "F", "G", "H"]:
+            ws2.column_dimensions[col].width = 18
 
     out = io.BytesIO()
     wb.save(out)
@@ -1914,6 +2273,18 @@ prep_btn = st.button("Собрать _Анализ", disabled=prep_disabled)
 
 if prep_btn:
     status = st.empty()
+    prog = st.progress(0)
+
+    def _ui_progress(frac: float, msg: str) -> None:
+        status.info(msg)
+        try:
+            prog.progress(int(round(frac * 100)))
+        except Exception:
+            try:
+                prog.progress(frac)
+            except Exception:
+                pass
+
     status.info("Сборка…")
     try:
         analysis_file = None
@@ -1943,6 +2314,7 @@ if prep_btn:
             osv_files=osv_files,
             analysis_name_for_new=analysis_title,
             osv_prefix_by_sheet=osv_prefix_by_sheet,
+            progress_cb=_ui_progress,
         )
 
         st.session_state["prepared_bytes"] = out_bytes
@@ -1950,6 +2322,7 @@ if prep_btn:
         st.session_state["availability"] = availability
         st.session_state["prep_report"] = prep_report
         st.session_state.pop("processed_bytes", None)
+        _ui_progress(1.0, "Сборка: готово.")
         status.success("Готово.")
     except Exception as e:
         status.error(f"Ошибка сборки: {e}")
