@@ -1669,19 +1669,25 @@ def run_code_2(file_bytes: bytes) -> bytes:
             ws[f"{get_column_letter(start_col_perf + i)}2"] = label
 
         start_row = 3
-        for idx, key in enumerate(all_keys):
-            row = start_row + idx
+        row = start_row
+        for key in all_keys:
             name, contract = key
+
+            py = payments_year.get(key, [0, 0, 0])
+            pf = performance_year.get(key, [0, 0, 0])
+
+            # Drop rows where both totals (F and J) would be zero.
+            # F = SUM(C:E) = sum(py), J = SUM(G:I) = sum(pf)*1.12
+            if abs(float(py[0]) + float(py[1]) + float(py[2])) < 1e-9 and abs(float(pf[0]) + float(pf[1]) + float(pf[2])) < 1e-9:
+                continue
 
             ws[f"A{row}"] = name
             ws[f"B{row}"] = contract
 
-            py = payments_year.get(key, [0, 0, 0])
             ws[f"C{row}"] = py[0]
             ws[f"D{row}"] = py[1]
             ws[f"E{row}"] = py[2]
 
-            pf = performance_year.get(key, [0, 0, 0])
             ws[f"G{row}"] = pf[0] * 1.12
             ws[f"H{row}"] = pf[1] * 1.12
             ws[f"I{row}"] = pf[2] * 1.12
@@ -1698,7 +1704,9 @@ def run_code_2(file_bytes: bytes) -> bytes:
             for i in range(12):
                 ws[f"{get_column_letter(start_col_perf + i)}{row}"] = mf[i] * 1.12
 
-        last_row = start_row + len(all_keys) - 1 if all_keys else 2
+            row += 1
+
+        last_row = row - 1 if row > start_row else 2
 
         regular = Font(name="Arial", size=10)
         bold = Font(name="Arial", size=10, bold=True)
