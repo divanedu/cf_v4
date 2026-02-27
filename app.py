@@ -1340,11 +1340,12 @@ def run_code_1(file_bytes: bytes) -> bytes:
         ws2 = wb.create_sheet(out2_name)
 
         ws2["A1"] = "Все значения указаны в тысячах тенге"
-        ws2["A1"].font = Font(name="Arial", size=10, bold=True)
+        ws2["A1"].font = Font(name="Calibri", size=10, bold=True)
 
-        font_h = Font(name="Arial", size=10, bold=True)
-        font_b = Font(name="Arial", size=10)
-        font_bb = Font(name="Arial", size=10, bold=True)
+        # "сальд (2)" should be Calibri everywhere.
+        font_h = Font(name="Calibri", size=10, bold=True)
+        font_b = Font(name="Calibri", size=10)
+        font_bb = Font(name="Calibri", size=10, bold=True)
         align_c = Alignment(horizontal="center")
         align_l = Alignment(horizontal="left")
         num_fmt = "#,##0;[Red](#,##0)"
@@ -1382,21 +1383,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws2[c].font = font_h
             ws2[c].alignment = align_c if c != "B2" else align_l
 
-        ws2["B34"] = "Контрагент"
-        ws2["C34"] = "1710"
-        ws2["D34"] = "3310"
-        ws2["E34"] = "сальдо с поставщиками"
-        for c in ("B34", "C34", "D34", "E34"):
-            ws2[c].font = font_h
-            ws2[c].alignment = align_c if c != "B34" else align_l
-
-        total_header_row = 66
-        ws2[f"B{total_header_row}"] = "Контрагент"
-        ws2[f"E{total_header_row}"] = "общее сальдо"
-        ws2[f"B{total_header_row}"].font = font_h
-        ws2[f"E{total_header_row}"].font = font_h
-        ws2[f"B{total_header_row}"].alignment = align_l
-        ws2[f"E{total_header_row}"].alignment = align_c
+        # Suppliers / Total sections are placed dynamically below (because we add summary lines).
 
         # Pick Wr/Mr per prefix (if present) for formulas
         pref_norm = normalize_prefix(prefix)
@@ -1405,144 +1392,497 @@ def run_code_1(file_bytes: bytes) -> bytes:
         wr_ref = _excel_sheet_ref(wr_name)
         mr_ref = _excel_sheet_ref(mr_name)
 
-        # Top 15 + / Top 15 - blocks
-        df_c2 = _top15_pos_neg(df_cust, "сальдо заказчики")
-        df_s2 = _top15_pos_neg(df_supp, "сальдо поставщики")
-        df_t2 = _top15_pos_neg(df_total, "общее сальдо")
-
-        def _write_rows(df: pd.DataFrame, start_row: int, kind: str) -> None:
+        def _comment_formula_for_row(r: int, which: str) -> str:
             """
-            kind: 'cust'|'supp'|'total'
-            Writes up to 30 rows into B..E and adds formulas for G/H and month blocks where requested.
+            which: 'cust' or 'supp'
+            Returns Excel formula for column F based on J:AG (payments) and AI:BF (performances for 3510).
             """
-            for i in range(30):
-                r = start_row + i
-                if df is None or i >= len(df.index):
-                    continue
-                row = df.iloc[i]
-                contr = str(row.get("Контрагент", "")).strip()
-                if not contr:
-                    continue
+            last_pos = f"IFERROR(LOOKUP(2,1/($J{r}:$AG{r}<>0),COLUMN($J{r}:$AG{r}))-COLUMN($J{r})+1,0)"
+            months_since_last_pay = (
+                f"IF(({last_pos})=0,999,"
+                f"DATEDIF("
+                f"DATE(LEFT(INDEX($J$2:$AG$2,1,({last_pos})),4),RIGHT(INDEX($J$2:$AG$2,1,({last_pos})),2),1),"
+                f"DATE(YEAR(TODAY()),MONTH(TODAY()),1),\"m\"))"
+            )
 
-                ws2.cell(row=r, column=2, value=contr).font = font_b
-                ws2.cell(row=r, column=2).alignment = align_l
+            def _rule_by_last_pay(t_ok: int, t_warn: int, warn_label: str) -> str:
+                return (
+                    f"IF(({last_pos})=0,\"списание\","
+                    f"IF(({months_since_last_pay})<={t_ok},\"ОК\","
+                    f"IF(({months_since_last_pay})<={t_warn},\"{warn_label}\",\"списание\")))"
+                )
 
-                if kind == "cust":
-                    v1210 = int(round(float(row.get("1210", 0) or 0)))
-                    v3510 = int(round(float(row.get("3510", 0) or 0)))
-                    vsaldo = int(round(float(row.get("сальдо заказчики", 0) or 0)))
-                    ws2.cell(row=r, column=3, value=v1210).number_format = num_fmt
-                    ws2.cell(row=r, column=4, value=v3510).number_format = num_fmt
-                    ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
-                    ws2.cell(row=r, column=3).font = font_b
-                    ws2.cell(row=r, column=4).font = font_b
-                    ws2.cell(row=r, column=5).font = font_bb
-                    for c in (3, 4, 5):
-                        ws2.cell(row=r, column=c).alignment = align_c
+            idx_now_pay = "IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$J$2:$AG$2,0),COUNTA($J$2:$AG$2))"
+            idx_now_perf = "IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$AI$2:$BF$2,0),COUNTA($AI$2:$BF$2))"
+            sum_pay_0_3 = f"SUM(INDEX($J{r}:$AG{r},1,MAX(1,({idx_now_pay})-2)):INDEX($J{r}:$AG{r},1,({idx_now_pay})))"
+            sum_perf_0_3 = f"SUM(INDEX($AI{r}:$BF{r},1,MAX(1,({idx_now_perf})-2)):INDEX($AI{r}:$BF{r},1,({idx_now_perf})))"
+            sum_pay_0_12 = f"SUM(INDEX($J{r}:$AG{r},1,MAX(1,({idx_now_pay})-11)):INDEX($J{r}:$AG{r},1,({idx_now_pay})))"
+            sum_perf_0_12 = f"SUM(INDEX($AI{r}:$BF{r},1,MAX(1,({idx_now_perf})-11)):INDEX($AI{r}:$BF{r},1,({idx_now_perf})))"
+            rule_3510 = (
+                f"IF(AND(({sum_pay_0_3})<>0,({sum_perf_0_3})<>0),\"ОК\","
+                f"IF(OR(({sum_pay_0_12})<>0,({sum_perf_0_12})<>0),\"сомнительно\",\"списание\"))"
+            )
 
-                elif kind == "supp":
-                    v1710 = int(round(float(row.get("1710", 0) or 0)))
-                    v3310 = int(round(float(row.get("3310", 0) or 0)))
-                    vsaldo = int(round(float(row.get("сальдо поставщики", 0) or 0)))
-                    ws2.cell(row=r, column=3, value=v1710).number_format = num_fmt
-                    ws2.cell(row=r, column=4, value=v3310).number_format = num_fmt
-                    ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
-                    ws2.cell(row=r, column=3).font = font_b
-                    ws2.cell(row=r, column=4).font = font_b
-                    ws2.cell(row=r, column=5).font = font_bb
-                    for c in (3, 4, 5):
-                        ws2.cell(row=r, column=c).alignment = align_c
+            if which == "cust":
+                rule_1210 = _rule_by_last_pay(3, 6, "сомнительный")
+                return f"=IF($B{r}=\"\",\"\",IF($E{r}>0,{rule_1210},{rule_3510}))"
+            # suppliers
+            rule_1710 = _rule_by_last_pay(3, 6, "сомнительный")
+            rule_3310 = _rule_by_last_pay(3, 12, "сомнительный")
+            return f"=IF($B{r}=\"\",\"\",IF($E{r}>0,{rule_1710},{rule_3310}))"
 
-                else:  # total
-                    vtot = int(round(float(row.get("общее сальдо", 0) or 0)))
-                    ws2.cell(row=r, column=5, value=vtot).number_format = num_fmt
-                    ws2.cell(row=r, column=5).font = font_bb
-                    ws2.cell(row=r, column=5).alignment = align_c
+        def _rollup_pay_formula(r: int) -> str:
+            return (
+                f'=IF($B{r}="","",SUM('
+                f'INDEX($J{r}:$AG{r},1,MAX(1,IFERROR(MATCH(TEXT(TODAY(),"yyyy")&"_"&TEXT(TODAY(),"mm"),$J$2:$AG$2,0),COUNTA($J$2:$AG$2))-$A$2+1)):'
+                f'INDEX($J{r}:$AG{r},1,IFERROR(MATCH(TEXT(TODAY(),"yyyy")&"_"&TEXT(TODAY(),"mm"),$J$2:$AG$2,0),COUNTA($J$2:$AG$2)))))'
+            )
 
-                # G/H rollups (only for customers/suppliers blocks; not for total block)
-                if kind != "total":
+        def _rollup_perf_formula(r: int) -> str:
+            return (
+                f'=IF($B{r}="","",SUM('
+                f'INDEX($AI{r}:$BF{r},1,MAX(1,IFERROR(MATCH(TEXT(TODAY(),"yyyy")&"_"&TEXT(TODAY(),"mm"),$AI$2:$BF$2,0),COUNTA($AI$2:$BF$2))-$A$2+1)):'
+                f'INDEX($AI{r}:$BF{r},1,IFERROR(MATCH(TEXT(TODAY(),"yyyy")&"_"&TEXT(TODAY(),"mm"),$AI$2:$BF$2,0),COUNTA($AI$2:$BF$2)))))'
+            )
+
+        def _write_customer_row(r: int, contr: str, v1210: int, v3510: int, vsaldo: int) -> None:
+            ws2.cell(row=r, column=2, value=contr).font = font_b
+            ws2.cell(row=r, column=2).alignment = align_l
+
+            ws2.cell(row=r, column=3, value=v1210).number_format = num_fmt
+            ws2.cell(row=r, column=4, value=v3510).number_format = num_fmt
+            ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
+            ws2.cell(row=r, column=3).font = font_b
+            ws2.cell(row=r, column=4).font = font_b
+            # No bold for top-15 counterparties rows.
+            ws2.cell(row=r, column=5).font = font_b
+            for c in (3, 4, 5):
+                ws2.cell(row=r, column=c).alignment = align_c
+
+            ws2.cell(row=r, column=6, value=_comment_formula_for_row(r, "cust")).alignment = align_l
+            ws2.cell(row=r, column=6).font = font_b
+
+            ws2.cell(row=r, column=7, value=_rollup_pay_formula(r)).alignment = align_c
+            ws2.cell(row=r, column=7).font = font_b
+            ws2.cell(row=r, column=7).number_format = num_fmt
+
+            ws2.cell(row=r, column=8, value=_rollup_perf_formula(r)).alignment = align_c
+            ws2.cell(row=r, column=8).font = font_b
+            ws2.cell(row=r, column=8).number_format = num_fmt
+
+            # J..AG payments from Wr
+            for ci in range(10, 34):  # J..AG
+                col_letter = get_column_letter(ci)
+                ws2.cell(
+                    row=r,
+                    column=ci,
+                    value=(
+                        f'=IF($B{r}="","",'
+                        f'SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"1210",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
+                        f'+SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"3510",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
+                        f')'
+                    ),
+                ).number_format = num_fmt
+                ws2.cell(row=r, column=ci).alignment = align_c
+
+            # AI..AT (2025) *1.12, AU..BF (2026) *1.16 from Mr
+            for ci in range(35, 47):  # AI..AT
+                col_letter = get_column_letter(ci)
+                ws2.cell(
+                    row=r,
+                    column=ci,
+                    value=(
+                        f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Q:$Q,$B{r},{mr_ref}!$G:$G,"6010")*1.12)'
+                    ),
+                ).number_format = num_fmt
+                ws2.cell(row=r, column=ci).alignment = align_c
+
+            for ci in range(47, 59):  # AU..BF
+                col_letter = get_column_letter(ci)
+                ws2.cell(
+                    row=r,
+                    column=ci,
+                    value=(
+                        f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Q:$Q,$B{r},{mr_ref}!$G:$G,"6010")*1.16)'
+                    ),
+                ).number_format = num_fmt
+                ws2.cell(row=r, column=ci).alignment = align_c
+
+        def _write_supplier_row(r: int, contr: str, v1710: int, v3310: int, vsaldo: int) -> None:
+            ws2.cell(row=r, column=2, value=contr).font = font_b
+            ws2.cell(row=r, column=2).alignment = align_l
+
+            ws2.cell(row=r, column=3, value=v1710).number_format = num_fmt
+            ws2.cell(row=r, column=4, value=v3310).number_format = num_fmt
+            ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
+            ws2.cell(row=r, column=3).font = font_b
+            ws2.cell(row=r, column=4).font = font_b
+            # No bold for top-15 counterparties rows.
+            ws2.cell(row=r, column=5).font = font_b
+            for c in (3, 4, 5):
+                ws2.cell(row=r, column=c).alignment = align_c
+
+            ws2.cell(row=r, column=6, value=_comment_formula_for_row(r, "supp")).alignment = align_l
+            ws2.cell(row=r, column=6).font = font_b
+
+            ws2.cell(row=r, column=7, value=_rollup_pay_formula(r)).alignment = align_c
+            ws2.cell(row=r, column=7).font = font_b
+            ws2.cell(row=r, column=7).number_format = num_fmt
+
+            # For suppliers: only payments block J..AG (no performances)
+            for ci in range(10, 34):  # J..AG
+                col_letter = get_column_letter(ci)
+                ws2.cell(
+                    row=r,
+                    column=ci,
+                    value=(
+                        f'=IF($B{r}="","",'
+                        f'SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"1710",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
+                        f'+SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"3310",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
+                        f')'
+                    ),
+                ).number_format = num_fmt
+                ws2.cell(row=r, column=ci).alignment = align_c
+
+        def _write_summary_rows(kind: str, pos_start: int, pos_end: int, sum_row: int, other_row: int, total_row: int) -> None:
+            """
+            Writes TOP-15 sum, прочее, ИТОГО rows for a block.
+            kind: 'cust' or 'supp'
+            """
+            # Labels
+            # Bold only "ТОП-15" and "ИТОГО" rows; "прочее" stays regular.
+            ws2.cell(row=sum_row, column=2, value="ТОП-15").font = font_h
+            ws2.cell(row=other_row, column=2, value="прочее").font = font_b
+            ws2.cell(row=total_row, column=2, value="ИТОГО").font = font_h
+            for rr in (sum_row, other_row, total_row):
+                ws2.cell(row=rr, column=2).alignment = align_l
+
+            def _sum_formula(col_letter: str) -> str:
+                return f"=SUM({col_letter}{pos_start}:{col_letter}{pos_end})"
+
+            # TOP-15 sums (B label; C/D/E; G/H; months)
+            for col_letter in ("C", "D", "E", "G"):
+                c = ws2[f"{col_letter}{sum_row}"]
+                c.value = _sum_formula(col_letter)
+                c.font = font_bb
+                c.alignment = align_c
+                c.number_format = num_fmt
+
+            if kind == "cust":
+                c = ws2[f"H{sum_row}"]
+                c.value = _sum_formula("H")
+                c.font = font_bb
+                c.alignment = align_c
+                c.number_format = num_fmt
+
+            for ci in range(10, 34):  # J..AG
+                col_letter = get_column_letter(ci)
+                c = ws2.cell(row=sum_row, column=ci, value=_sum_formula(col_letter))
+                c.alignment = align_c
+                c.number_format = num_fmt
+                c.font = font_bb
+            if kind == "cust":
+                for ci in range(35, 59):  # AI..BF
+                    col_letter = get_column_letter(ci)
+                    c = ws2.cell(row=sum_row, column=ci, value=_sum_formula(col_letter))
+                    c.alignment = align_c
+                    c.number_format = num_fmt
+                    c.font = font_bb
+
+            # ИТОГО values (hard for saldo columns) + formulas for payments/perf totals without counterparty criterion
+            if kind == "cust":
+                tot_1210 = int(round(float(df_cust["1210"].sum() if not df_cust.empty else 0.0)))
+                tot_3510 = int(round(float(df_cust["3510"].sum() if not df_cust.empty else 0.0)))
+                tot_saldo = int(round(float(df_cust["сальдо заказчики"].sum() if not df_cust.empty else 0.0)))
+                ws2[f"C{total_row}"] = tot_1210
+                ws2[f"D{total_row}"] = tot_3510
+                ws2[f"E{total_row}"] = tot_saldo
+                for addr in (f"C{total_row}", f"D{total_row}", f"E{total_row}"):
+                    ws2[addr].font = font_bb
+                    ws2[addr].alignment = align_c
+                    ws2[addr].number_format = num_fmt
+
+                # Totals by months (payments Wr, performances Mr) without counterparty filter
+                for ci in range(10, 34):  # J..AG
+                    col_letter = get_column_letter(ci)
                     ws2.cell(
-                        row=r,
-                        column=7,
+                        row=total_row,
+                        column=ci,
                         value=(
-                            f'=IF($B{r}="","",SUM('
-                            f'INDEX($J{r}:$AG{r},1,MAX(1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$J$2:$AG$2,0),COUNTA($J$2:$AG$2))-$A$2+1)):'
-                            f'INDEX($J{r}:$AG{r},1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$J$2:$AG$2,0),COUNTA($J$2:$AG$2)))))'
+                            f'=SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"1210",{wr_ref}!$P:$P,{col_letter}$2)'
+                            f'+SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"3510",{wr_ref}!$P:$P,{col_letter}$2)'
                         ),
-                    ).alignment = align_c
-                    ws2.cell(row=r, column=7).font = font_b
-                    ws2.cell(row=r, column=7).number_format = num_fmt
+                    ).number_format = num_fmt
+                    ws2.cell(row=total_row, column=ci).alignment = align_c
+                    ws2.cell(row=total_row, column=ci).font = font_bb
 
+                for ci in range(35, 47):  # AI..AT
+                    col_letter = get_column_letter(ci)
                     ws2.cell(
-                        row=r,
-                        column=8,
+                        row=total_row,
+                        column=ci,
+                        value=f'=SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$G:$G,"6010")*1.12',
+                    ).number_format = num_fmt
+                    ws2.cell(row=total_row, column=ci).alignment = align_c
+                    ws2.cell(row=total_row, column=ci).font = font_bb
+                for ci in range(47, 59):  # AU..BF
+                    col_letter = get_column_letter(ci)
+                    ws2.cell(
+                        row=total_row,
+                        column=ci,
+                        value=f'=SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$G:$G,"6010")*1.16',
+                    ).number_format = num_fmt
+                    ws2.cell(row=total_row, column=ci).alignment = align_c
+                    ws2.cell(row=total_row, column=ci).font = font_bb
+
+                # G/H rollups for totals row
+                ws2.cell(row=total_row, column=7, value=_rollup_pay_formula(total_row)).alignment = align_c
+                ws2.cell(row=total_row, column=7).number_format = num_fmt
+                ws2.cell(row=total_row, column=7).font = font_bb
+                ws2.cell(row=total_row, column=8, value=_rollup_perf_formula(total_row)).alignment = align_c
+                ws2.cell(row=total_row, column=8).number_format = num_fmt
+                ws2.cell(row=total_row, column=8).font = font_bb
+
+            else:
+                tot_1710 = int(round(float(df_supp["1710"].sum() if not df_supp.empty else 0.0)))
+                tot_3310 = int(round(float(df_supp["3310"].sum() if not df_supp.empty else 0.0)))
+                tot_saldo = int(round(float(df_supp["сальдо поставщики"].sum() if not df_supp.empty else 0.0)))
+                ws2[f"C{total_row}"] = tot_1710
+                ws2[f"D{total_row}"] = tot_3310
+                ws2[f"E{total_row}"] = tot_saldo
+                for addr in (f"C{total_row}", f"D{total_row}", f"E{total_row}"):
+                    ws2[addr].font = font_bb
+                    ws2[addr].alignment = align_c
+                    ws2[addr].number_format = num_fmt
+
+                for ci in range(10, 34):  # J..AG
+                    col_letter = get_column_letter(ci)
+                    ws2.cell(
+                        row=total_row,
+                        column=ci,
                         value=(
-                            f'=IF($B{r}="","",SUM('
-                            f'INDEX($AI{r}:$BF{r},1,MAX(1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$AI$2:$BF$2,0),COUNTA($AI$2:$BF$2))-$A$2+1)):'
-                            f'INDEX($AI{r}:$BF{r},1,IFERROR(MATCH(TEXT(TODAY(),\"yyyy\")&\"_\"&TEXT(TODAY(),\"mm\"),$AI$2:$BF$2,0),COUNTA($AI$2:$BF$2)))))'
+                            f'=SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"1710",{wr_ref}!$P:$P,{col_letter}$2)'
+                            f'+SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"3310",{wr_ref}!$P:$P,{col_letter}$2)'
                         ),
-                    ).alignment = align_c
-                    ws2.cell(row=r, column=8).font = font_b
-                    ws2.cell(row=r, column=8).number_format = num_fmt
+                    ).number_format = num_fmt
+                    ws2.cell(row=total_row, column=ci).alignment = align_c
+                    ws2.cell(row=total_row, column=ci).font = font_bb
 
-                # Month formulas
-                if kind == "cust":
-                    # J..AG payments from Wr
-                    for ci in range(10, 34):  # J..AG
-                        col_letter = get_column_letter(ci)
-                        ws2.cell(
-                            row=r,
-                            column=ci,
-                            value=(
-                                f'=IF($B{r}="","",'
-                                f'SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,\"1210\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
-                                f'+SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,\"3510\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
-                                f')'
-                            ),
-                        ).number_format = num_fmt
-                        ws2.cell(row=r, column=ci).alignment = align_c
+                ws2.cell(row=total_row, column=7, value=_rollup_pay_formula(total_row)).alignment = align_c
+                ws2.cell(row=total_row, column=7).number_format = num_fmt
+                ws2.cell(row=total_row, column=7).font = font_bb
 
-                    # AI..AT (2025) *1.12, AU..BF (2026) *1.16 from Mr
-                    for ci in range(35, 47):  # AI..AT
-                        col_letter = get_column_letter(ci)
-                        ws2.cell(
-                            row=r,
-                            column=ci,
-                            value=(
-                                f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Q:$Q,$B{r},{mr_ref}!$G:$G,\"6010\")*1.12)'
-                            ),
-                        ).number_format = num_fmt
-                        ws2.cell(row=r, column=ci).alignment = align_c
+            # прочее = ИТОГО - ТОП-15 (for numeric/month columns)
+            for col_letter in ("C", "D", "E", "G"):
+                ws2[f"{col_letter}{other_row}"] = f"={col_letter}{total_row}-{col_letter}{sum_row}"
+                ws2[f"{col_letter}{other_row}"].font = font_b
+                ws2[f"{col_letter}{other_row}"].alignment = align_c
+                ws2[f"{col_letter}{other_row}"].number_format = num_fmt
 
-                    for ci in range(47, 59):  # AU..BF
-                        col_letter = get_column_letter(ci)
-                        ws2.cell(
-                            row=r,
-                            column=ci,
-                            value=(
-                                f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Q:$Q,$B{r},{mr_ref}!$G:$G,\"6010\")*1.16)'
-                            ),
-                        ).number_format = num_fmt
-                        ws2.cell(row=r, column=ci).alignment = align_c
+            if kind == "cust":
+                ws2[f"H{other_row}"] = f"=H{total_row}-H{sum_row}"
+                ws2[f"H{other_row}"].font = font_b
+                ws2[f"H{other_row}"].alignment = align_c
+                ws2[f"H{other_row}"].number_format = num_fmt
 
-                elif kind == "supp":
-                    for ci in range(10, 34):  # J..AG
-                        col_letter = get_column_letter(ci)
-                        ws2.cell(
-                            row=r,
-                            column=ci,
-                            value=(
-                                f'=IF($B{r}="","",'
-                                f'SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,\"1710\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
-                                f'+SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,\"3310\",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
-                                f')'
-                            ),
-                        ).number_format = num_fmt
-                        ws2.cell(row=r, column=ci).alignment = align_c
+            for ci in range(10, 34):  # J..AG
+                col_letter = get_column_letter(ci)
+                ws2.cell(row=other_row, column=ci, value=f"={col_letter}{total_row}-{col_letter}{sum_row}").number_format = num_fmt
+                ws2.cell(row=other_row, column=ci).alignment = align_c
+            if kind == "cust":
+                for ci in range(35, 59):  # AI..BF
+                    col_letter = get_column_letter(ci)
+                    ws2.cell(row=other_row, column=ci, value=f"={col_letter}{total_row}-{col_letter}{sum_row}").number_format = num_fmt
+                    ws2.cell(row=other_row, column=ci).alignment = align_c
 
-        _write_rows(df_c2, start_row=3, kind="cust")
-        _write_rows(df_s2, start_row=35, kind="supp")
-        _write_rows(df_t2, start_row=67, kind="total")
+        # === Customers section (fixed layout with summary lines)
+        cust_pos = df_cust[df_cust["сальдо заказчики"] > 0].nlargest(15, "сальдо заказчики") if not df_cust.empty else df_cust
+        cust_neg = df_cust[df_cust["сальдо заказчики"] < 0].nsmallest(15, "сальдо заказчики") if not df_cust.empty else df_cust
+
+        cust_pos_start, cust_pos_end = 3, 17
+        cust_pos_sum, cust_pos_other, cust_pos_total = 18, 19, 20
+        cust_gap = 21
+        cust_neg_start, cust_neg_end = 22, 36
+        cust_neg_sum, cust_neg_other, cust_neg_total = 37, 38, 39
+        cust_end_gap = 40
+
+        for i in range(15):
+            if cust_pos is None or i >= len(cust_pos.index):
+                continue
+            rr = cust_pos_start + i
+            r0 = cust_pos.iloc[i]
+            contr = str(r0.get("Контрагент", "")).strip()
+            if not contr:
+                continue
+            _write_customer_row(
+                rr,
+                contr,
+                int(round(float(r0.get("1210", 0) or 0))),
+                int(round(float(r0.get("3510", 0) or 0))),
+                int(round(float(r0.get("сальдо заказчики", 0) or 0))),
+            )
+
+        _write_summary_rows("cust", cust_pos_start, cust_pos_end, cust_pos_sum, cust_pos_other, cust_pos_total)
+
+        for i in range(15):
+            if cust_neg is None or i >= len(cust_neg.index):
+                continue
+            rr = cust_neg_start + i
+            r0 = cust_neg.iloc[i]
+            contr = str(r0.get("Контрагент", "")).strip()
+            if not contr:
+                continue
+            _write_customer_row(
+                rr,
+                contr,
+                int(round(float(r0.get("1210", 0) or 0))),
+                int(round(float(r0.get("3510", 0) or 0))),
+                int(round(float(r0.get("сальдо заказчики", 0) or 0))),
+            )
+
+        _write_summary_rows("cust", cust_neg_start, cust_neg_end, cust_neg_sum, cust_neg_other, cust_neg_total)
+
+        # === Suppliers section starts below customers
+        supp_header_row = cust_end_gap + 2  # blank line after customers block
+        ws2[f"B{supp_header_row}"] = "Контрагент"
+        ws2[f"C{supp_header_row}"] = "1710"
+        ws2[f"D{supp_header_row}"] = "3310"
+        ws2[f"E{supp_header_row}"] = "сальдо с поставщиками"
+        for caddr in (f"B{supp_header_row}", f"C{supp_header_row}", f"D{supp_header_row}", f"E{supp_header_row}"):
+            ws2[caddr].font = font_h
+            ws2[caddr].alignment = align_l if caddr.startswith("B") else align_c
+
+        supp_pos = df_supp[df_supp["сальдо поставщики"] > 0].nlargest(15, "сальдо поставщики") if not df_supp.empty else df_supp
+        supp_neg = df_supp[df_supp["сальдо поставщики"] < 0].nsmallest(15, "сальдо поставщики") if not df_supp.empty else df_supp
+
+        supp_pos_start, supp_pos_end = supp_header_row + 1, supp_header_row + 15
+        supp_pos_sum, supp_pos_other, supp_pos_total = supp_pos_end + 1, supp_pos_end + 2, supp_pos_end + 3
+        supp_neg_start, supp_neg_end = supp_pos_end + 5, supp_pos_end + 19
+        supp_neg_sum, supp_neg_other, supp_neg_total = supp_neg_end + 1, supp_neg_end + 2, supp_neg_end + 3
+
+        for i in range(15):
+            if supp_pos is None or i >= len(supp_pos.index):
+                continue
+            rr = supp_pos_start + i
+            r0 = supp_pos.iloc[i]
+            contr = str(r0.get("Контрагент", "")).strip()
+            if not contr:
+                continue
+            _write_supplier_row(
+                rr,
+                contr,
+                int(round(float(r0.get("1710", 0) or 0))),
+                int(round(float(r0.get("3310", 0) or 0))),
+                int(round(float(r0.get("сальдо поставщики", 0) or 0))),
+            )
+        _write_summary_rows("supp", supp_pos_start, supp_pos_end, supp_pos_sum, supp_pos_other, supp_pos_total)
+
+        for i in range(15):
+            if supp_neg is None or i >= len(supp_neg.index):
+                continue
+            rr = supp_neg_start + i
+            r0 = supp_neg.iloc[i]
+            contr = str(r0.get("Контрагент", "")).strip()
+            if not contr:
+                continue
+            _write_supplier_row(
+                rr,
+                contr,
+                int(round(float(r0.get("1710", 0) or 0))),
+                int(round(float(r0.get("3310", 0) or 0))),
+                int(round(float(r0.get("сальдо поставщики", 0) or 0))),
+            )
+        _write_summary_rows("supp", supp_neg_start, supp_neg_end, supp_neg_sum, supp_neg_other, supp_neg_total)
+
+        # === Total saldo section (overall) — only saldo values + summary lines
+        total_header_row = supp_neg_total + 5  # blank line after suppliers block
+        ws2[f"B{total_header_row}"] = "Контрагент"
+        ws2[f"E{total_header_row}"] = "общее сальдо"
+        ws2[f"B{total_header_row}"].font = font_h
+        ws2[f"E{total_header_row}"].font = font_h
+        ws2[f"B{total_header_row}"].alignment = align_l
+        ws2[f"E{total_header_row}"].alignment = align_c
+
+        total_pos = df_total[df_total["общее сальдо"] > 0].nlargest(15, "общее сальдо") if not df_total.empty else df_total
+        total_neg = df_total[df_total["общее сальдо"] < 0].nsmallest(15, "общее сальдо") if not df_total.empty else df_total
+
+        total_pos_start, total_pos_end = total_header_row + 1, total_header_row + 15
+        total_pos_sum, total_pos_other, total_pos_total = total_pos_end + 1, total_pos_end + 2, total_pos_end + 3
+        total_neg_start, total_neg_end = total_pos_end + 5, total_pos_end + 19
+        total_neg_sum, total_neg_other, total_neg_total = total_neg_end + 1, total_neg_end + 2, total_neg_end + 3
+
+        def _write_total_row(r: int, contr: str, vtot: int) -> None:
+            ws2.cell(row=r, column=2, value=contr).font = font_b
+            ws2.cell(row=r, column=2).alignment = align_l
+            # No bold for top-15 counterparties rows.
+            ws2.cell(row=r, column=5, value=vtot).font = font_b
+            ws2.cell(row=r, column=5).alignment = align_c
+            ws2.cell(row=r, column=5).number_format = num_fmt
+
+        for i in range(15):
+            if total_pos is None or i >= len(total_pos.index):
+                continue
+            rr = total_pos_start + i
+            r0 = total_pos.iloc[i]
+            contr = str(r0.get("Контрагент", "")).strip()
+            if not contr:
+                continue
+            _write_total_row(rr, contr, int(round(float(r0.get("общее сальдо", 0) or 0))))
+
+        # Summary (positive block)
+        ws2.cell(row=total_pos_sum, column=2, value="ТОП-15").font = font_h
+        ws2.cell(row=total_pos_other, column=2, value="прочее").font = font_h
+        ws2.cell(row=total_pos_total, column=2, value="ИТОГО").font = font_h
+        for rr in (total_pos_sum, total_pos_other, total_pos_total):
+            ws2.cell(row=rr, column=2).alignment = align_l
+
+        ws2[f"E{total_pos_sum}"] = f"=SUM(E{total_pos_start}:E{total_pos_end})"
+        ws2[f"E{total_pos_sum}"].font = font_bb
+        ws2[f"E{total_pos_sum}"].alignment = align_c
+        ws2[f"E{total_pos_sum}"].number_format = num_fmt
+
+        total_all = int(round(float(df_total["общее сальдо"].sum() if not df_total.empty else 0.0)))
+        ws2[f"E{total_pos_total}"] = total_all
+        ws2[f"E{total_pos_total}"].font = font_bb
+        ws2[f"E{total_pos_total}"].alignment = align_c
+        ws2[f"E{total_pos_total}"].number_format = num_fmt
+
+        ws2[f"E{total_pos_other}"] = f"=E{total_pos_total}-E{total_pos_sum}"
+        ws2[f"E{total_pos_other}"].font = font_b
+        ws2[f"E{total_pos_other}"].alignment = align_c
+        ws2[f"E{total_pos_other}"].number_format = num_fmt
+
+        for i in range(15):
+            if total_neg is None or i >= len(total_neg.index):
+                continue
+            rr = total_neg_start + i
+            r0 = total_neg.iloc[i]
+            contr = str(r0.get("Контрагент", "")).strip()
+            if not contr:
+                continue
+            _write_total_row(rr, contr, int(round(float(r0.get("общее сальдо", 0) or 0))))
+
+        # Summary (negative block)
+        ws2.cell(row=total_neg_sum, column=2, value="ТОП-15").font = font_h
+        ws2.cell(row=total_neg_other, column=2, value="прочее").font = font_h
+        ws2.cell(row=total_neg_total, column=2, value="ИТОГО").font = font_h
+        for rr in (total_neg_sum, total_neg_other, total_neg_total):
+            ws2.cell(row=rr, column=2).alignment = align_l
+
+        ws2[f"E{total_neg_sum}"] = f"=SUM(E{total_neg_start}:E{total_neg_end})"
+        ws2[f"E{total_neg_sum}"].font = font_bb
+        ws2[f"E{total_neg_sum}"].alignment = align_c
+        ws2[f"E{total_neg_sum}"].number_format = num_fmt
+
+        ws2[f"E{total_neg_total}"] = total_all
+        ws2[f"E{total_neg_total}"].font = font_bb
+        ws2[f"E{total_neg_total}"].alignment = align_c
+        ws2[f"E{total_neg_total}"].number_format = num_fmt
+
+        ws2[f"E{total_neg_other}"] = f"=E{total_neg_total}-E{total_neg_sum}"
+        ws2[f"E{total_neg_other}"].font = font_b
+        ws2[f"E{total_neg_other}"].alignment = align_c
+        ws2[f"E{total_neg_other}"].number_format = num_fmt
 
         # Minimal widths for readability
         ws2.column_dimensions["A"].width = 6
