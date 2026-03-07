@@ -17,10 +17,10 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 
 
 # =========================
-# Helpers
+# Вспомогательные функции
 # =========================
 def safe_sheet_name(name: str) -> str:
-    """Excel: max 31 chars, cannot contain : \\ / ? * [ ]"""
+    """Правила Excel для имени листа: максимум 31 символ, нельзя : \\ / ? * [ ]"""
     banned = [":", "\\", "/", "?", "*", "[", "]"]
     for ch in banned:
         name = name.replace(ch, "")
@@ -37,14 +37,14 @@ def safe_filename(name: str) -> str:
 
 
 def split_prefix_suffix4(sheet_name: str) -> Tuple[str, str]:
-    """prefix + last 4 chars (lowercased)"""
+    """(префикс, последние 4 символа)"""
     if len(sheet_name) < 4:
         return sheet_name, ""
     return sheet_name[:-4], sheet_name[-4:].lower()
 
 
 def split_prefix_suffix2(sheet_name: str) -> Tuple[str, str]:
-    """prefix + last 2 chars (lowercased)"""
+    """(префикс, последние 2 символа)"""
     if len(sheet_name) < 2:
         return sheet_name, ""
     return sheet_name[:-2], sheet_name[-2:].lower()
@@ -72,8 +72,8 @@ def make_unique_sheet_title(wb, desired_title: str) -> str:
 
 def make_unique_with_fixed_suffix(wb, prefix: str, suffix: str) -> str:
     """
-    Returns a unique title that always ends with `suffix` (e.g. '1210' or 'wd').
-    If `prefix+suffix` exists, inserts a counter before the suffix: f'{prefix}{i}{suffix}'.
+    Возвращает уникальное имя листа, которое ВСЕГДА заканчивается на `suffix` (например, '1210' или 'Wd').
+    Если `prefix+suffix` уже существует, вставляет счётчик перед suffix: f'{prefix}{i}{suffix}'.
     """
     prefix = (prefix or "").strip()
     suffix = (suffix or "").strip()
@@ -84,7 +84,7 @@ def make_unique_with_fixed_suffix(wb, prefix: str, suffix: str) -> str:
     i = 1
     while True:
         mid = str(i)
-        # ensure total length <= 31 and ends with suffix
+        # Следим за ограничениями Excel: общая длина <= 31 и окончание = суффикс (важно для логики поиска листов).
         max_prefix_len = 31 - len(mid) - len(suffix)
         p = prefix[:max_prefix_len] if max_prefix_len > 0 else ""
         candidate = safe_sheet_name(f"{p}{mid}{suffix}")
@@ -105,8 +105,8 @@ def is_xls_filename(filename: str) -> bool:
 
 def convert_xls_to_xlsx_via_excel(xls_bytes: bytes, original_name: str) -> Tuple[str, bytes]:
     """
-    Converts .xls bytes to .xlsx bytes using installed Microsoft Excel (COM).
-    Works only on Windows with Excel installed and pywin32 available.
+    Конвертирует байты .xls в байты .xlsx с помощью установленного Microsoft Excel (COM).
+    Работает только на Windows, где установлен Excel и доступен pywin32.
     """
     if os.name != "nt":
         raise RuntimeError("Конвертация .xls поддерживается только на Windows с установленным Excel.")
@@ -135,7 +135,7 @@ def convert_xls_to_xlsx_via_excel(xls_bytes: bytes, original_name: str) -> Tuple
         excel.DisplayAlerts = False
         wb = excel.Workbooks.Open(xls_path, ReadOnly=True)
         try:
-            # 51 = xlOpenXMLWorkbook (.xlsx)
+            # 51 = xlOpenXMLWorkbook (.xlsx) — формат сохранения для Excel COM
             wb.SaveAs(xlsx_path, FileFormat=51)
         finally:
             wb.Close(SaveChanges=False)
@@ -169,8 +169,9 @@ def convert_xls_to_xlsx_via_excel(xls_bytes: bytes, original_name: str) -> Tuple
 
 def ensure_openpyxl_bytes(filename: str, file_bytes: bytes, cache: Optional[Dict[Tuple[str, int], Tuple[str, bytes]]] = None) -> Tuple[str, bytes]:
     """
-    Ensures we return bytes loadable by openpyxl (xlsx/xlsm). Converts xls -> xlsx if needed.
-    `cache` is keyed by (filename, len(bytes)).
+    Гарантирует, что на выходе будут байты, которые читает openpyxl (xlsx/xlsm).
+    Если загружен .xls — конвертируем в .xlsx (локально на Windows через Excel COM).
+    `cache` ключуется по (filename, len(bytes)), чтобы не конвертировать один и тот же файл повторно.
     """
     if not is_xls_filename(filename):
         return filename, file_bytes
@@ -203,7 +204,8 @@ def copy_sheet(src_ws, dst_wb, new_title: str):
     for merged in list(src_ws.merged_cells.ranges):
         dst_ws.merge_cells(str(merged))
 
-    # Fast path: copy only instantiated cells (values/styles), avoids scanning huge blank rectangles.
+    # Быстрый путь: копируем только реально существующие ячейки (значения/стили),
+    # чтобы не сканировать огромные "пустые" прямоугольники.
     for (_r, _c), cell in getattr(src_ws, "_cells", {}).items():
         if isinstance(cell, MergedCell):
             continue
@@ -220,8 +222,8 @@ def copy_sheet(src_ws, dst_wb, new_title: str):
 
 
 def excel_col_width_from_pixels(px: float) -> float:
-    # Approximation for Excel default font metrics.
-    # Common mapping: pixels ~= width*7 + 5  => width ~= (px-5)/7
+    # Приблизительный перевод пикселей в "ширину колонки" Excel (по умолчанию).
+    # Часто используют оценку: пиксели ~= width*7 + 5  => width ~= (px-5)/7
     try:
         px = float(px)
     except Exception:
@@ -232,7 +234,7 @@ def excel_col_width_from_pixels(px: float) -> float:
 def set_all_columns_width(ws, px: float):
     width = excel_col_width_from_pixels(px)
     max_col = ws.max_column or 1
-    # Safety cap in case max_column is corrupted by formatting.
+    # Ограничение на случай, если max_column "раздулся" из-за форматирования.
     max_col = min(max_col, 2000)
     for i in range(1, max_col + 1):
         col = get_column_letter(i)
@@ -241,7 +243,7 @@ def set_all_columns_width(ws, px: float):
 
 
 REGISTRY_COL_WIDTH_PX = 48.0
-# Excel row height uses points. User requirement: fixed height (no auto-growth).
+# Высота строк в Excel задаётся в пунктах (points). Требование: фиксированная высота (без авто-роста).
 REGISTRY_ROW_HEIGHT_PT = 28.8
 
 
@@ -259,7 +261,7 @@ def format_registry_sheet(ws) -> None:
     rows: Set[int] = set(getattr(ws, "row_dimensions", {}).keys())
     for (r, _c), cell in getattr(ws, "_cells", {}).items():
         rows.add(int(r))
-        # Force no wrapping to avoid row auto-growth in Excel UI.
+        # Принудительно отключаем перенос текста, иначе Excel может визуально увеличивать высоту строки.
         try:
             al = cell.alignment
             if al and getattr(al, "wrap_text", None):
@@ -277,8 +279,8 @@ def format_registry_sheet(ws) -> None:
         except Exception:
             pass
 
-    # Set explicit height for rows that exist in dimensions or have cells.
-    # (Avoid iterating 1..max_row for speed.)
+    # Ставим высоту только тем строкам, которые реально существуют (в row_dimensions или есть ячейки),
+    # чтобы не гонять цикл 1..max_row на больших листах.
     for r in rows:
         try:
             ws.row_dimensions[r].height = REGISTRY_ROW_HEIGHT_PT
@@ -344,8 +346,8 @@ def merge_wh_m_into_analysis_with_prefix(
     prefix: str,
 ) -> Dict[str, List[str]]:
     """
-    Same as merge_wh_m_into_analysis, but forces the provided prefix on imported sheet names.
-    Ensures names end with expected suffixes (Wd/Md etc.) so contracts detection keeps working.
+    То же, что merge_wh_m_into_analysis, но принудительно добавляет префикс к импортируемым листам.
+    Важно: сохраняем ожидаемые суффиксы (Wd/Md и т.п.), чтобы блок "Контракты" корректно находил пары листов.
     """
     report = {"missing_wh": [], "missing_m": [], "copied": []}
     p = (prefix or "").strip()
@@ -358,7 +360,7 @@ def merge_wh_m_into_analysis_with_prefix(
                 report["missing_m"].append(src_title)
                 continue
             new_title = make_unique_sheet_title(analysis_wb, f"{p}{base}")
-            # Keep Md suffix intact for contracts pairing.
+            # Суффикс Md должен остаться Md, иначе не соберём пары Wd/Md при создании "контр".
             if base.lower().endswith("md"):
                 new_title = make_unique_with_fixed_suffix(analysis_wb, p + base[:-2], "Md")
             dst_ws = copy_sheet(m_wb[src_title], analysis_wb, new_title)
@@ -392,10 +394,10 @@ def merge_wh_m_into_analysis_with_prefix(
 
 
 # =========================
-# OSV Cleaning (auto for "random named" OSV files)
+# Очистка ОСВ (автоматически для ОСВ с "рандомным" именем файла)
 # =========================
 MAX_CELLS_PER_SHEET = 300_000
-SORT_ACCOUNTS = {"1310", "1320", "1330"}  # only these accounts sorted by column G
+SORT_ACCOUNTS = {"1310", "1320", "1330"}  # только эти счета сортируем по колонке G
 OSV_BAD_WORDS = [
     "Договор", "Догов", "Д/р о государственных закупках",
     "KZT", "RUB", "EUR", "USD", "Жетысу",
@@ -654,7 +656,7 @@ def get_account_number(ws) -> Optional[str]:
         else:
             candidates.append(str(v))
 
-    # If row 2 is part of a merged header where the value sits in row 1, grab the top-left value.
+    # Если 2-я строка часть объединённой шапки, а значение лежит в 1-й строке — берём левую-верхнюю ячейку merge-диапазона.
     for r in ws.merged_cells.ranges:
         min_col, min_row, max_col2, max_row2 = r.bounds
         if not (min_row <= 2 <= max_row2):
@@ -675,7 +677,7 @@ def get_account_number(ws) -> Optional[str]:
     def _pick_from_text(s: str) -> Optional[str]:
         s_norm = _normalize(s)
         s_low = s_norm.lower()
-        # Prefer the 4 digits that follow the word "счет".
+        # Приоритет: 4 цифры сразу после слова "счет".
         idx = s_low.find("счет")
         if idx != -1:
             tail = s_norm[idx:]
@@ -683,12 +685,12 @@ def get_account_number(ws) -> Optional[str]:
             m = re.search(r"(\\d{4})", tail_compact)
             if m:
                 return m.group(1)
-        # Fallback: any 4 consecutive digits (after compacting spaces between digits)
+        # Фолбэк: любые 4 подряд идущие цифры (предварительно "сжимаем" пробелы между цифрами).
         compact = s_norm.replace("\u00A0", "").replace("\u202F", "").replace(" ", "")
         m = re.search(r"(\\d{4})", compact)
         if m:
             return m.group(1)
-        # Last resort: take first 4 digits from digits-only string.
+        # Последний шанс: берём первые 4 цифры из строки, где оставили только цифры.
         d = _digits_compact(s_norm)
         if len(d) >= 4:
             return d[:4]
@@ -801,7 +803,7 @@ def clean_osv_sheet_inplace(ws) -> Optional[str]:
     start_row = find_first_row_with_value(ws, account_number, col=1)
     end_row = find_first_row_with_value(ws, "Итого", col=1)
     if end_row is None:
-        # Some OSV exports use "Итого:" or "Итого ..." in column A.
+        # Некоторые ОСВ выгрузки пишут "Итого:" или "Итого ..." в колонке A.
         for r in range(1, (ws.max_row or 1) + 1):
             v = ws.cell(row=r, column=1).value
             if v is None:
@@ -812,7 +814,7 @@ def clean_osv_sheet_inplace(ws) -> Optional[str]:
                 break
     if not start_row or not end_row:
         set_all_rows_height(ws, 12)
-        # Still keep the sheet: we at least know the account number.
+        # Лист не выкидываем: номер счета мы всё равно знаем, и дальше он нужен в _Анализ.
         return account_number
 
     for r in range(ws.max_row or 1, start_row - 1, -1):
@@ -892,13 +894,13 @@ def add_cleaned_osv_files_to_analysis(analysis_wb, osv_files: Iterable[Tuple[str
         for ws in osv_wb.worksheets:
             acc = clean_osv_sheet_inplace(ws)
             if not acc:
-                # Do not drop the sheet: still add it, but name it generically.
+                # Не выбрасываем лист: добавляем в _Анализ, но называем нейтрально, чтобы не ломать сборку.
                 fallback = make_unique_sheet_title(analysis_wb, "OSV")
                 copy_sheet(ws, analysis_wb, fallback)
                 report["skipped"].append(f"{fname}:{ws.title} (не найден счет во 2-й строке)")
                 report["added"].append(f"{fname}:{ws.title} -> {fallback}")
             else:
-                # Keep account suffix intact (important for saldo detection on *1210/*1710/*3310/*3510).
+                # Суффикс счета должен остаться (важно: Сальдо ищет *1210/*1710/*3310/*3510 по названию листа).
                 if acc.isdigit() and len(acc) == 4:
                     new_title = make_unique_with_fixed_suffix(analysis_wb, "", acc)
                 else:
@@ -945,7 +947,7 @@ def find_existing_saldo_prefixes(wb) -> Dict[str, Set[str]]:
 
 
 def list_existing_saldo_sheets_with_a1(wb) -> List[Tuple[str, str, str]]:
-    """Returns tuples: (sheetname, account_suffix, A1_text) for saldo accounts."""
+    """Возвращает кортежи (имя_листа, счет_суффикс, A1_текст) для ОСВ-счетов сальдо."""
     accounts = {"1210", "1710", "3310", "3510"}
     out = []
     for sh in wb.sheetnames:
@@ -995,8 +997,8 @@ def build_analysis_workbook(
         _step(f"Открываю {analysis_name}")
     else:
         analysis_wb = Workbook()
-        # Keep a visible placeholder sheet so saving never fails with
-        # "At least one sheet must be visible" even if all inputs are skipped.
+        # Держим видимый "служебный" лист, чтобы сохранение не падало с
+        # "At least one sheet must be visible" даже если все входные листы пропущены/пустые.
         placeholder_ws = analysis_wb.active
         placeholder_title = "Сборка"
         placeholder_ws.title = placeholder_title
@@ -1032,7 +1034,8 @@ def build_analysis_workbook(
 
     if osv_files:
         osv_prefix_by_sheet = osv_prefix_by_sheet or {}
-        # We need per-account prefix control for saldo accounts to avoid collisions while keeping suffixes intact.
+        # Для ОСВ-счетов (1210/1710/3310/3510) префиксы задаём по каждому листу, чтобы избежать коллизий,
+        # но при этом сохранить суффикс счета в названии (это критично для дальнейшей обработки).
         report_local = {"added": [], "skipped": []}
         for fname, fbytes in osv_files:
             _step(f"ОСВ: очищаю {fname}")
@@ -1064,11 +1067,11 @@ def build_analysis_workbook(
             report["warnings"].append(f"ОСВ: пропущены листы: {len(osv_report['skipped'])}. {details}{more}")
         report["copied"].extend(osv_report["added"])
 
-    # Drop placeholder if we successfully added at least one real sheet.
+    # Удаляем служебный лист, если в книге уже появился хотя бы один "нормальный" лист.
     if placeholder_title and len(analysis_wb.sheetnames) > 1 and placeholder_title in analysis_wb.sheetnames:
         del analysis_wb[placeholder_title]
 
-    # Ensure at least one visible sheet exists (openpyxl requirement on save).
+    # Гарантируем, что есть хотя бы один видимый лист (требование openpyxl при сохранении).
     if not analysis_wb.sheetnames:
         ws = analysis_wb.create_sheet("Сборка")
         ws["A1"] = "Пустой файл: не удалось добавить ни одного листа."
@@ -1085,9 +1088,9 @@ def build_analysis_workbook(
 
 
 # =========================
-# CODE 1 (Saldo) — multi-company by prefix + ####
-# Finds sheets where last 4 chars are 1210/1710/3310/3510
-# Creates output sheet per prefix: "<prefix>сальд" or "сальд" if no prefix
+# CODE 1 (Сальдо) — несколько компаний через префиксы
+# Ищем листы, у которых последние 4 символа = 1210/1710/3310/3510
+# Создаём лист на каждый префикс: "<префикс>сальд" или "сальд" (если префикса нет)
 # =========================
 def run_code_1(file_bytes: bytes) -> bytes:
     wb = load_workbook(io.BytesIO(file_bytes))
@@ -1107,7 +1110,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
         raise ValueError("Код 1: не найдено листов, заканчивающихся на 1210/1710/3310/3510.")
 
     def _excel_sheet_ref(sheet_name: str) -> str:
-        # Quote if needed and escape apostrophes (Excel style).
+        # Если нужно — оборачиваем имя листа в кавычки и экранируем апострофы (правила Excel).
         if sheet_name is None:
             return "''"
         s = str(sheet_name)
@@ -1119,8 +1122,8 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
     def _find_prefixed_sheetname(prefix_norm: str, base2: str) -> Optional[str]:
         """
-        Finds sheet like: "<prefix>Wr" / "<prefix>Mr" (case-insensitive),
-        optionally with " (n)" suffix. Returns the best candidate or None.
+        Ищет лист вида "<префикс>Wr" / "<префикс>Mr" (регистр не важен),
+        также допускается суффикс " (n)". Возвращает лучший кандидат или None.
         """
         base2_l = base2.lower()
         best = None
@@ -1135,7 +1138,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 continue
             m = re.search(r"\((\d+)\)\s*$", nm)
             n = int(m.group(1)) if m else 0
-            key = (1 if m else 0, n, len(nm))  # prefer exact name without (n)
+            key = (1 if m else 0, n, len(nm))  # предпочитаем точное имя без " (n)"
             if best is None or key < best_key:
                 best = nm
                 best_key = key
@@ -1215,7 +1218,10 @@ def run_code_1(file_bytes: bytes) -> bytes:
         else:
             df_total = pd.DataFrame(columns=["Контрагент", "общее сальдо"])
 
-        out_sheet_name = safe_sheet_name(f"{prefix}сальд" if prefix else "сальд")
+        # Переименование по требованию:
+        # - "сальд" (базовый лист) теперь называется "сальд (2)"
+        # - "сальд (2)" (расширенный лист) теперь называется "сальд"
+        out_sheet_name = safe_sheet_name(f"{prefix}сальд (2)" if prefix else "сальд (2)")
         if out_sheet_name in wb.sheetnames:
             wb.remove(wb[out_sheet_name])
         ws = wb.create_sheet(out_sheet_name)
@@ -1332,9 +1338,9 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws.column_dimensions[get_column_letter(col)].width = WIDTH_NUM
 
         # =========================
-        # Sheet "сальд (2)" — Top 15 + / Top 15 - with month formulas
+        # Лист "сальд (2)" — топ-15 (плюс/минус) + блоки оплат/выполнений с формулами по месяцам
         # =========================
-        out2_name = safe_sheet_name(f"{prefix}сальд (2)" if prefix else "сальд (2)")
+        out2_name = safe_sheet_name(f"{prefix}сальд" if prefix else "сальд")
         if out2_name in wb.sheetnames:
             wb.remove(wb[out2_name])
         ws2 = wb.create_sheet(out2_name)
@@ -1342,7 +1348,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
         ws2["A1"] = "Все значения указаны в тысячах тенге"
         ws2["A1"].font = Font(name="Calibri", size=10, bold=True)
 
-        # "сальд (2)" should be Calibri everywhere.
+        # На "сальд (2)" везде используем Calibri.
         font_h = Font(name="Calibri", size=10, bold=True)
         font_b = Font(name="Calibri", size=10)
         font_bb = Font(name="Calibri", size=10, bold=True)
@@ -1350,14 +1356,14 @@ def run_code_1(file_bytes: bytes) -> bytes:
         align_l = Alignment(horizontal="left")
         num_fmt = "#,##0;[Red](#,##0)"
 
-        # A2 = 6, left + soft gray fill
+        # A2 = 6 (влево + мягкая серая заливка)
         ws2["A2"] = 6
         ws2["A2"].alignment = Alignment(horizontal="left")
         ws2["A2"].fill = PatternFill("solid", fgColor="D9D9D9")
 
         ws2["F2"] = "коммент"
 
-        # Use & concatenation to avoid Excel adding implicit-intersection "@"
+        # Используем конкатенацию через &, чтобы Excel не добавлял неявное пересечение ("@")
         ws2["G2"] = '="Опл L"&$A$2&"M"'
         ws2["H2"] = '="Вып L"&$A$2&"M"'
 
@@ -1366,7 +1372,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
         ws2["P1"].font = font_h
         ws2["AO1"].font = font_h
 
-        # Month headers
+        # Заголовки месяцев
         months = [f"2025_{m:02d}" for m in range(1, 13)] + [f"2026_{m:02d}" for m in range(1, 13)]
         for i, m in enumerate(months):
             ws2.cell(row=2, column=10 + i, value=m).font = font_h  # J..AG
@@ -1374,7 +1380,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws2.cell(row=2, column=35 + i, value=m).font = font_h  # AI..BF
             ws2.cell(row=2, column=35 + i, value=m).alignment = align_c
 
-        # Table headers
+        # Заголовки таблиц
         ws2["B2"] = "Контрагент"
         ws2["C2"] = "1210"
         ws2["D2"] = "3510"
@@ -1383,9 +1389,9 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws2[c].font = font_h
             ws2[c].alignment = align_c if c != "B2" else align_l
 
-        # Suppliers / Total sections are placed dynamically below (because we add summary lines).
+        # Блоки "Поставщики" и "Общее сальдо" размещаем ниже динамически (так как добавляем строки сумм/итого).
 
-        # Pick Wr/Mr per prefix (if present) for formulas
+        # Подбираем Wr/Mr для текущего префикса (если такие листы есть) — имена нужны внутри формул.
         pref_norm = normalize_prefix(prefix)
         wr_name = _find_prefixed_sheetname(pref_norm, "Wr") or (f"{prefix}Wr" if prefix else "Wr")
         mr_name = _find_prefixed_sheetname(pref_norm, "Mr") or (f"{prefix}Mr" if prefix else "Mr")
@@ -1395,7 +1401,9 @@ def run_code_1(file_bytes: bytes) -> bytes:
         def _comment_formula_for_row(r: int, which: str) -> str:
             """
             which: 'cust' or 'supp'
-            Returns Excel formula for column F based on J:AG (payments) and AI:BF (performances for 3510).
+            Возвращает Excel-формулу для колонки F на основе:
+            - оплат J:AG
+            - выполнений AI:BF (нужно только для правила по 3510)
             """
             last_pos = f"IFERROR(LOOKUP(2,1/($J{r}:$AG{r}<>0),COLUMN($J{r}:$AG{r}))-COLUMN($J{r})+1,0)"
             months_since_last_pay = (
@@ -1426,7 +1434,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             if which == "cust":
                 rule_1210 = _rule_by_last_pay(3, 6, "сомнительный")
                 return f"=IF($B{r}=\"\",\"\",IF($E{r}>0,{rule_1210},{rule_3510}))"
-            # suppliers
+            # поставщики
             rule_1710 = _rule_by_last_pay(3, 6, "сомнительный")
             rule_3310 = _rule_by_last_pay(3, 12, "сомнительный")
             return f"=IF($B{r}=\"\",\"\",IF($E{r}>0,{rule_1710},{rule_3310}))"
@@ -1454,7 +1462,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
             ws2.cell(row=r, column=3).font = font_b
             ws2.cell(row=r, column=4).font = font_b
-            # No bold for top-15 counterparties rows.
+            # Для строк с контрагентами (топ-15) числа НЕ делаем жирными.
             ws2.cell(row=r, column=5).font = font_b
             for c in (3, 4, 5):
                 ws2.cell(row=r, column=c).alignment = align_c
@@ -1470,7 +1478,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws2.cell(row=r, column=8).font = font_b
             ws2.cell(row=r, column=8).number_format = num_fmt
 
-            # J..AG payments from Wr
+            # J..AG: оплаты из Wr
             for ci in range(10, 34):  # J..AG
                 col_letter = get_column_letter(ci)
                 ws2.cell(
@@ -1485,7 +1493,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 ).number_format = num_fmt
                 ws2.cell(row=r, column=ci).alignment = align_c
 
-            # AI..AT (2025) *1.12, AU..BF (2026) *1.16 from Mr
+            # AI..AT (2025) *1.12 и AU..BF (2026) *1.16 — выполнения из Mr
             for ci in range(35, 47):  # AI..AT
                 col_letter = get_column_letter(ci)
                 ws2.cell(
@@ -1517,7 +1525,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws2.cell(row=r, column=5, value=vsaldo).number_format = num_fmt
             ws2.cell(row=r, column=3).font = font_b
             ws2.cell(row=r, column=4).font = font_b
-            # No bold for top-15 counterparties rows.
+            # Для строк с контрагентами (топ-15) числа НЕ делаем жирными.
             ws2.cell(row=r, column=5).font = font_b
             for c in (3, 4, 5):
                 ws2.cell(row=r, column=c).alignment = align_c
@@ -1529,7 +1537,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             ws2.cell(row=r, column=7).font = font_b
             ws2.cell(row=r, column=7).number_format = num_fmt
 
-            # For suppliers: only payments block J..AG (no performances)
+            # Для поставщиков: только оплаты J..AG (выполнений нет)
             for ci in range(10, 34):  # J..AG
                 col_letter = get_column_letter(ci)
                 ws2.cell(
@@ -1549,8 +1557,8 @@ def run_code_1(file_bytes: bytes) -> bytes:
             Writes TOP-15 sum, прочее, ИТОГО rows for a block.
             kind: 'cust' or 'supp'
             """
-            # Labels
-            # Bold only "ТОП-15" and "ИТОГО" rows; "прочее" stays regular.
+            # Подписи строк
+            # Жирным выделяем только строки "ТОП-15" и "ИТОГО"; "прочее" оставляем обычным.
             ws2.cell(row=sum_row, column=2, value="ТОП-15").font = font_h
             ws2.cell(row=other_row, column=2, value="прочее").font = font_b
             ws2.cell(row=total_row, column=2, value="ИТОГО").font = font_h
@@ -1560,7 +1568,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             def _sum_formula(col_letter: str) -> str:
                 return f"=SUM({col_letter}{pos_start}:{col_letter}{pos_end})"
 
-            # TOP-15 sums (B label; C/D/E; G/H; months)
+            # Суммы по ТОП-15 (C/D/E, G/H и по месяцам)
             for col_letter in ("C", "D", "E", "G"):
                 c = ws2[f"{col_letter}{sum_row}"]
                 c.value = _sum_formula(col_letter)
@@ -1589,7 +1597,9 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     c.number_format = num_fmt
                     c.font = font_bb
 
-            # ИТОГО values (hard for saldo columns) + formulas for payments/perf totals without counterparty criterion
+            # ИТОГО:
+            # - по сальдо (C/D/E) пишем числом (посчитано в pandas)
+            # - оплаты/выполнения по месяцам считаем формулами без критерия контрагента
             if kind == "cust":
                 tot_1210 = int(round(float(df_cust["1210"].sum() if not df_cust.empty else 0.0)))
                 tot_3510 = int(round(float(df_cust["3510"].sum() if not df_cust.empty else 0.0)))
@@ -1602,7 +1612,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     ws2[addr].alignment = align_c
                     ws2[addr].number_format = num_fmt
 
-                # Totals by months (payments Wr, performances Mr) without counterparty filter
+                # ИТОГО по месяцам (оплаты Wr, выполнения Mr) без фильтра по контрагенту
                 for ci in range(10, 34):  # J..AG
                     col_letter = get_column_letter(ci)
                     ws2.cell(
@@ -1635,7 +1645,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     ws2.cell(row=total_row, column=ci).alignment = align_c
                     ws2.cell(row=total_row, column=ci).font = font_bb
 
-                # G/H rollups for totals row
+                # G/H суммы за "последние A2 месяцев" для строки ИТОГО
                 ws2.cell(row=total_row, column=7, value=_rollup_pay_formula(total_row)).alignment = align_c
                 ws2.cell(row=total_row, column=7).number_format = num_fmt
                 ws2.cell(row=total_row, column=7).font = font_bb
@@ -1672,7 +1682,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 ws2.cell(row=total_row, column=7).number_format = num_fmt
                 ws2.cell(row=total_row, column=7).font = font_bb
 
-            # прочее = ИТОГО - ТОП-15 (for numeric/month columns)
+            # прочее = ИТОГО - ТОП-15 (для чисел и для помесячных колонок)
             for col_letter in ("C", "D", "E", "G"):
                 ws2[f"{col_letter}{other_row}"] = f"={col_letter}{total_row}-{col_letter}{sum_row}"
                 ws2[f"{col_letter}{other_row}"].font = font_b
@@ -1695,7 +1705,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     ws2.cell(row=other_row, column=ci, value=f"={col_letter}{total_row}-{col_letter}{sum_row}").number_format = num_fmt
                     ws2.cell(row=other_row, column=ci).alignment = align_c
 
-        # === Customers section (fixed layout with summary lines)
+        # === Заказчики (фиксированная раскладка + строки ТОП-15/прочее/ИТОГО)
         cust_pos = df_cust[df_cust["сальдо заказчики"] > 0].nlargest(15, "сальдо заказчики") if not df_cust.empty else df_cust
         cust_neg = df_cust[df_cust["сальдо заказчики"] < 0].nsmallest(15, "сальдо заказчики") if not df_cust.empty else df_cust
 
@@ -1742,8 +1752,8 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
         _write_summary_rows("cust", cust_neg_start, cust_neg_end, cust_neg_sum, cust_neg_other, cust_neg_total)
 
-        # === Suppliers section starts below customers
-        supp_header_row = cust_end_gap + 2  # blank line after customers block
+        # === Поставщики (ниже блока заказчиков)
+        supp_header_row = cust_end_gap + 2  # пустая строка после блока заказчиков
         ws2[f"B{supp_header_row}"] = "Контрагент"
         ws2[f"C{supp_header_row}"] = "1710"
         ws2[f"D{supp_header_row}"] = "3310"
@@ -1794,8 +1804,8 @@ def run_code_1(file_bytes: bytes) -> bytes:
             )
         _write_summary_rows("supp", supp_neg_start, supp_neg_end, supp_neg_sum, supp_neg_other, supp_neg_total)
 
-        # === Total saldo section (overall) — only saldo values + summary lines
-        total_header_row = supp_neg_total + 5  # blank line after suppliers block
+        # === Общее сальдо (ниже поставщиков): только значение сальдо + строки ТОП-15/прочее/ИТОГО
+        total_header_row = supp_neg_total + 5  # пустая строка после блока поставщиков
         ws2[f"B{total_header_row}"] = "Контрагент"
         ws2[f"E{total_header_row}"] = "общее сальдо"
         ws2[f"B{total_header_row}"].font = font_h
@@ -1814,7 +1824,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
         def _write_total_row(r: int, contr: str, vtot: int) -> None:
             ws2.cell(row=r, column=2, value=contr).font = font_b
             ws2.cell(row=r, column=2).alignment = align_l
-            # No bold for top-15 counterparties rows.
+            # Для строк с контрагентами (топ-15) числа НЕ делаем жирными.
             ws2.cell(row=r, column=5, value=vtot).font = font_b
             ws2.cell(row=r, column=5).alignment = align_c
             ws2.cell(row=r, column=5).number_format = num_fmt
@@ -1829,7 +1839,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 continue
             _write_total_row(rr, contr, int(round(float(r0.get("общее сальдо", 0) or 0))))
 
-        # Summary (positive block)
+        # Сводные строки (положительный блок)
         ws2.cell(row=total_pos_sum, column=2, value="ТОП-15").font = font_h
         ws2.cell(row=total_pos_other, column=2, value="прочее").font = font_h
         ws2.cell(row=total_pos_total, column=2, value="ИТОГО").font = font_h
@@ -1862,7 +1872,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 continue
             _write_total_row(rr, contr, int(round(float(r0.get("общее сальдо", 0) or 0))))
 
-        # Summary (negative block)
+        # Сводные строки (отрицательный блок)
         ws2.cell(row=total_neg_sum, column=2, value="ТОП-15").font = font_h
         ws2.cell(row=total_neg_other, column=2, value="прочее").font = font_h
         ws2.cell(row=total_neg_total, column=2, value="ИТОГО").font = font_h
@@ -1884,7 +1894,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
         ws2[f"E{total_neg_other}"].alignment = align_c
         ws2[f"E{total_neg_other}"].number_format = num_fmt
 
-        # Minimal widths for readability
+        # Минимальные ширины колонок для читаемости
         ws2.column_dimensions["A"].width = 6
         ws2.column_dimensions["B"].width = 35
         for col in ["C", "D", "E", "F", "G", "H"]:
@@ -1896,8 +1906,8 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
 
 # =========================
-# CODE 2 (Contracts) — multi-company by prefix + (md/wd) ignoring case
-# Creates output sheet per prefix: "<prefix>контр" or "контр" if no prefix
+# CODE 2 (Контракты) — несколько компаний через префиксы (Wd/Md, регистр не важен)
+# Создаём лист на каждый префикс: "<префикс>контр" или "контр" (если префикса нет)
 # =========================
 def run_code_2(file_bytes: bytes) -> bytes:
     wb = load_workbook(io.BytesIO(file_bytes))
@@ -2016,8 +2026,10 @@ def run_code_2(file_bytes: bytes) -> bytes:
             py = payments_year.get(key, [0, 0, 0])
             pf = performance_year.get(key, [0, 0, 0])
 
-            # Drop rows where both totals (F and J) would be zero.
-            # F = SUM(C:E) = sum(py), J = SUM(G:I) = sum(pf)*1.12
+            # Убираем строки, где одновременно:
+            # - F (итого оплаты) = 0
+            # - J (итого выполнения) = 0
+            # Проверяем по исходным суммам (а не по формуле), чтобы не зависеть от пересчёта Excel.
             if abs(float(py[0]) + float(py[1]) + float(py[2])) < 1e-9 and abs(float(pf[0]) + float(pf[1]) + float(pf[2])) < 1e-9:
                 continue
 
@@ -2101,7 +2113,7 @@ def run_code_2(file_bytes: bytes) -> bytes:
                     bottom=cell.border.bottom,
                 )
 
-    # After building the contract sheet(s), drop source Wd/Md sheets from the output file.
+    # После формирования листа(ов) "контр" удаляем исходные листы Wd/Md из выходного файла.
     for sh in sorted(source_sheets_to_delete):
         if sh in wb.sheetnames:
             del wb[sh]
@@ -2112,13 +2124,13 @@ def run_code_2(file_bytes: bytes) -> bytes:
 
 
 # =========================
-# CODE 3 (Inventory / Запасы)
-# For each selected account (1310/1320/1330):
-# - Find sheets whose name contains the account substring.
-# - In each sheet, find the row in column A where the account appears.
-# - Write threshold % values into J..N above that row.
-# - Fill formulas in J..N for rows below until column G becomes empty.
-# Does not create any extra report sheets; UI uses returned report info.
+# CODE 3 (Запасы)
+# Для каждого выбранного счета (1310/1320/1330):
+# - находим лист(ы), где в названии встречается номер счета
+# - в листе ищем строку в колонке A, где ячейка равна номеру счета
+# - над блоком записываем пороги в J..N
+# - ниже заполняем формулы J..N до первой пустой ячейки в колонке G
+# Отдельных "отчётных" листов не создаём: UI показывает предупреждения по результату.
 # =========================
 def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes, Dict[str, List[str]]]:
     wb = load_workbook(io.BytesIO(file_bytes))
@@ -2151,7 +2163,7 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
     def _set_number_style(cell, bold: bool = False, fill=None):
         cell.number_format = "#,##0;[Red](#,##0)"
         cell.alignment = Alignment(horizontal="center", vertical="center")
-        # Force consistent font sizing for all J..N numbers (including totals).
+        # Фиксируем размер шрифта для всех чисел J..N (включая суммы), чтобы Excel не "плясал" стилями.
         cell.font = Font(name="Arial", size=9, bold=bold)
         if fill is not None:
             cell.fill = fill
@@ -2201,7 +2213,7 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
                 missing_markers.append(f"{account}: {sh} (слишком близко к началу листа)")
                 continue
 
-            # Thresholds (percent values stored as decimals).
+            # Пороговые значения (в Excel проценты храним как доли: 2.0 = 200%).
             _set_percent(ws, thr_low, 10, 2.0)   # J: 200%
             _set_percent(ws, thr_low, 11, 1.0)   # K: 100%
             _set_percent(ws, thr_high, 11, 2.0)  # K: 200%
@@ -2212,7 +2224,7 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
             _set_percent(ws, thr_low, 14, 0.0)   # N: 0%
             _set_percent(ws, thr_high, 14, 0.25) # N: 25%
 
-            # Fill formulas for inventory rows: from row after the marker until first blank in column G.
+            # Заполняем формулы по строкам запасов: от строки ниже маркера до первой пустой в колонке G.
             start_row = found_row + 1
             last = start_row - 1
             for r in range(start_row, ws.max_row + 1):
@@ -2223,18 +2235,18 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
 
             if last >= start_row:
                 _fill_formulas(ws, start_row, last, thr_low, thr_high)
-                # Totals on the same row where the account marker is found.
+                # Суммы ставим в строке, где найден номер счета (та же строка, что A=1310/1320/1330).
                 total_fill = PatternFill(fill_type="solid", fgColor="C6EFCE")
                 for col_letter, col_idx in [("J", 10), ("K", 11), ("L", 12), ("M", 13), ("N", 14)]:
                     cell = ws.cell(row=found_row, column=col_idx)
                     cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{last})"
                     _set_number_style(cell, bold=True, fill=total_fill)
 
-                # Dotted grid around the mini-table (thresholds + totals + data).
+                # Пунктирная рамка вокруг мини-таблицы (пороги + суммы + строки данных).
                 _apply_dotted_grid(ws, thr_low, last, 10, 14)
                 processed.append(f"{account}: {sh} (строки {start_row}-{last})")
             else:
-                # No data rows: still show dotted frame around thresholds + total row.
+                # Если данных нет — рамку всё равно рисуем вокруг порогов + строки сумм.
                 _apply_dotted_grid(ws, thr_low, found_row, 10, 14)
                 processed.append(f"{account}: {sh} (нет строк с данными в G ниже маркера)")
 
@@ -2244,19 +2256,36 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
 
 
 # =========================
-# UI — Theme toggle (Dark/Light), no gradients, default font
+# Интерфейс — стили и тема (без градиентов, фиксированный шрифт)
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
-# Dark theme only (deep navy)
-BG = "#1D2F4E"
-TEXT = "#EAF0FF"
-CARD = "#162844"
-BORDER = "#2B426A"
-MUTED = "#B6C4E3"
-BTN_BG = "#EADFCB"   # beige buttons
-BTN_TEXT = "#111111" # black text/icons
-PROG = "#A9C7FF"
+# Переключатель темы: на странице, максимально ненавязчиво (справа сверху).
+_tcol_l, _tcol_r = st.columns([0.93, 0.07])
+with _tcol_r:
+    # Без подписи: только тумблер. Подсказка при наведении.
+    light_mode = st.toggle("", value=False, key="light_theme", help="Переключить тему (светлая/тёмная)", label_visibility="collapsed")
+
+if light_mode:
+    # Светлая тема (инверсия)
+    BG = "#FFFFFF"
+    TEXT = "#0B0B0B"
+    CARD = "#FFFFFF"
+    BORDER = "#D0D0D0"
+    MUTED = "#4D4D4D"
+    BTN_BG = "#FFFFFF"
+    BTN_TEXT = "#0B0B0B"
+    PROG = "#2F5FD7"
+else:
+    # Тёмная тема: чёрный фон, белый текст (как просили)
+    BG = "#000000"
+    TEXT = "#FFFFFF"
+    CARD = "#000000"
+    BORDER = "#3A3A3A"
+    MUTED = "#CFCFCF"
+    BTN_BG = "#000000"
+    BTN_TEXT = "#FFFFFF"
+    PROG = "#FFFFFF"
 
 st.markdown(
     f"""
@@ -2408,6 +2437,27 @@ st.markdown(
       .stCaption {{
         color: {MUTED} !important;
       }}
+
+      /* Checkbox/toggle accents: make sure they are visible on both themes */
+      [data-testid="stCheckbox"] * {{
+        color: {TEXT} !important;
+      }}
+      input[type="checkbox"], input[type="radio"] {{
+        accent-color: {TEXT} !important;
+      }}
+
+      /* Theme toggle: компактный, без лишних отступов */
+      div[data-testid="stToggle"] {{
+        padding-top: 0.15rem !important;
+      }}
+      div[data-testid="stToggle"] > label {{
+        justify-content: flex-end !important;
+        gap: 0.25rem !important;
+      }}
+      /* Track / knob colors */
+      div[data-testid="stToggle"] svg {{
+        color: {TEXT} !important;
+      }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -2494,7 +2544,7 @@ st.caption("Выходной файл: " + out_name_preview)
 
 prep_disabled = needs_new_name and not analysis_title.strip()
 
-# Prefix questions for OSV duplicates (per uploaded OSV sheet)
+# Запрос префиксов для дубликатов ОСВ (на каждый загруженный лист ОСВ)
 osv_prefix_by_sheet: Dict[Tuple[str, str, int], str] = {}
 wh_prefix_by_file: Dict[str, str] = {}
 m_prefix_by_file: Dict[str, str] = {}
@@ -2523,7 +2573,7 @@ if analysis_wb_tmp is not None:
         if len(existing_saldo_info) > 12:
             st.caption(f"... и еще {len(existing_saldo_info) - 12}")
 
-# Detect all uploaded OSV sheets with 4-digit account numbers.
+# Находим все загруженные ОСВ-листы, у которых определился 4-значный номер счета.
 osv_items: List[Tuple[str, str, int, str, str]] = []
 for u in osv_list:
     try:
@@ -2551,7 +2601,8 @@ if need_prefix_items:
     st.markdown("#### Префиксы ОСВ (повторы/конфликт)")
     st.caption("Обнаружены повторяющиеся ОСВ по счетам или такие счета уже есть в _Анализ. Для КАЖДОГО ОСВ укажи префикс или отметь «без префикса».")
 
-    # Validate: within same account, the same prefix cannot be used twice; also disallow multiple 'без префикса'.
+    # Валидация: в рамках одного счета нельзя использовать один и тот же префикс дважды;
+    # "без префикса" тоже должен быть максимум один раз на счет.
     chosen_by_acc: Dict[str, List[str]] = defaultdict(list)
     for fname, sheet_title, idx, acc in need_prefix_items:
         company = ""
@@ -2582,7 +2633,7 @@ if need_prefix_items:
             prep_disabled = True
             st.caption(f"Для счета {acc} префиксы должны быть уникальными (включая «без префикса»).")
 
-# WH/M prefixes when multiple files are uploaded
+# Префиксы для WH_KZ / M_KZ, если загружено несколько файлов
 if len(wh_list) > 1:
     st.markdown("#### Префиксы WH_KZ")
     st.caption("Загружено несколько WH_KZ. Для каждого укажи префикс или «без префикса» (префиксы должны быть уникальными).")
