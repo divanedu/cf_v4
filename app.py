@@ -917,6 +917,9 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
     inv_map = {acc: any(acc in sh for sh in wb.sheetnames) for acc in inventory_accounts}
     saldo_ok = any(split_prefix_suffix4(sh)[1] in saldo_suffixes for sh in wb.sheetnames)
 
+    # ОСВ "общ" (казахстанская ОСВ) — для неё нужен справочник "Счета каз"
+    kaz_ok = ("общ" in wb.sheetnames) and ("Счета каз" in wb.sheetnames)
+
     prefix_to_pair: Dict[str, Dict[str, str]] = defaultdict(dict)
     for sh in wb.sheetnames:
         prefix, suf2 = split_prefix_suffix2(sh)
@@ -932,6 +935,7 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
         "saldo_ok": saldo_ok,
         "contracts_ok": contracts_ok,
         "contracts_prefixes": contracts_prefixes,
+        "kaz_ok": kaz_ok,
     }
 
 
@@ -2256,6 +2260,258 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
 
 
 # =========================
+# CODE 4 (Обработка общей ОСВ / Казахстан)
+# Работает по листу "общ" и использует справочник "Счета каз".
+# ВАЖНО: мы записываем именно формулы (строки начинающиеся с "="),
+# поэтому в выходном Excel они будут видны как формулы.
+# =========================
+def run_code_4_obsh_kaz(file_bytes: bytes) -> bytes:
+    wb = load_workbook(io.BytesIO(file_bytes))
+
+    if "общ" not in wb.sheetnames:
+        raise ValueError("Обработка общей ОСВ: не найден лист «общ».")
+    if "Счета каз" not in wb.sheetnames:
+        raise ValueError("Обработка общей ОСВ: не найден лист «Счета каз».")
+
+    ws = wb["общ"]
+
+    # На листе "общ" иногда есть объединённые ячейки (merged). openpyxl возвращает для них MergedCell,
+    # и попытка записать .value в такую ячейку падает (read-only). Поэтому все записи делаем "безопасно":
+    # если целевая ячейка входит в merged-диапазон — записываем в левую-верхнюю ячейку этого диапазона.
+    merged_ranges = list(getattr(ws.merged_cells, "ranges", []) or [])
+
+    def _merge_topleft(row: int, col: int) -> Optional[Tuple[int, int]]:
+        for mr in merged_ranges:
+            if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
+                return (mr.min_row, mr.min_col)
+        return None
+
+    def _safe_set_value(row: int, col: int, value) -> None:
+        cell = ws.cell(row=row, column=col)
+        if isinstance(cell, MergedCell):
+            tl = _merge_topleft(row, col)
+            if not tl:
+                return
+            ws.cell(row=tl[0], column=tl[1]).value = value
+            return
+        cell.value = value
+
+    # Ищем строку "Итого" по колонке A.
+    # Важно: в ОСВ могут встречаться промежуточные "Итого" внутри разделов,
+    # поэтому берём ПОСЛЕДНЕЕ вхождение в пределах разумного диапазона.
+    itogo_row = None
+    max_scan = min(max(ws.max_row, 1), 5000)
+    for r in range(8, max_scan + 1):
+        v = ws.cell(row=r, column=1).value
+        if v is None:
+            continue
+        s = str(v).strip()
+        if "Итого" in s:
+            itogo_row = r
+    if itogo_row is None:
+        raise ValueError("Обработка общей ОСВ: не найдена строка «Итого» в колонке A (до 5000 строки).")
+
+    last_data_row = itogo_row - 1
+    if last_data_row < 8:
+        raise ValueError("Обработка общей ОСВ: нет строк данных (ожидается минимум с 8 строки).")
+
+    # Родительские строки определяем по жирному шрифту в колонке A (8..last_data_row).
+    parent_rows: List[int] = []
+    for r in range(8, last_data_row + 1):
+        cell = ws.cell(row=r, column=1)
+        if cell.font and bool(cell.font.bold):
+            parent_rows.append(r)
+
+    # Формулы: K, L, M, N, P (O пропускаем).
+    for r in range(8, last_data_row + 1):
+        _safe_set_value(r, 11, f"=G{r}-C{r}")  # K
+        _safe_set_value(r, 12, f"=H{r}-D{r}")  # L
+        _safe_set_value(r, 13, f"=L{r}-K{r}")  # M
+        _safe_set_value(r, 14, f"=IFERROR(INDEX('Счета каз'!B:B,MATCH(LEFT(A{r},4),'Счета каз'!A:A,0)),0)")  # N
+        _safe_set_value(r, 16, f"=IFERROR(INDEX('Счета каз'!C:C,MATCH(LEFT(A{r},4),'Счета каз'!A:A,0)),0)")  # P
+
+    # Визуальный стиль как в шаблоне (обычно Aptos Display 9).
+    base_font = Font(name="Aptos Display", size=9)
+    base_font_bold = Font(name="Aptos Display", size=9, bold=True)
+    right = Alignment(horizontal="right", vertical="center")
+
+    # Заголовок P7
+    _safe_set_value(7, 16, "ЧОК")
+    p7 = ws.cell(row=7, column=16)
+    if isinstance(p7, MergedCell):
+        tl = _merge_topleft(7, 16)
+        if tl:
+            p7 = ws.cell(row=tl[0], column=tl[1])
+    p7.font = base_font_bold
+    p7.alignment = right
+
+    # Форматирование диапазонов
+    num_fmt = "#,##0"
+
+    # K:M
+    for row in ws.iter_rows(min_row=8, max_row=last_data_row, min_col=11, max_col=13):
+        for cell in row:
+            if isinstance(cell, MergedCell):
+                continue
+            cell.font = base_font
+            cell.alignment = right
+            cell.number_format = num_fmt
+
+    # N и P — шрифт + число + выравнивание (как в шаблоне)
+    for row in ws.iter_rows(min_row=8, max_row=last_data_row, min_col=14, max_col=14):
+        if not isinstance(row[0], MergedCell):
+            row[0].font = base_font
+            row[0].alignment = right
+            row[0].number_format = num_fmt
+    for row in ws.iter_rows(min_row=8, max_row=last_data_row, min_col=16, max_col=16):
+        if not isinstance(row[0], MergedCell):
+            row[0].font = base_font
+            row[0].alignment = right
+            row[0].number_format = num_fmt
+
+    # Границы
+    def _side(color: str) -> Side:
+        return Side(style="thin", color=color)
+
+    def _set_border(cell, left=None, right=None, top=None, bottom=None):
+        cell.border = Border(
+            left=_side(left) if left else None,
+            right=_side(right) if right else None,
+            top=_side(top) if top else None,
+            bottom=_side(bottom) if bottom else None,
+        )
+
+    C_GREEN = "ACC8BD"
+    C_GRAY = "A0A0A0"
+    C_BLACK = "000000"
+
+    # K8:P(last_data_row) — внешние + внутренние линии
+    min_row, max_row = 8, last_data_row
+    min_col, max_col = 11, 16
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            left_col = C_GREEN if c == min_col else C_GREEN  # inside vertical тоже зеленая
+            right_col = C_GREEN if c == max_col else C_GREEN
+            top_col = C_GREEN if r == min_row else C_GREEN   # inside horizontal тоже зеленая
+            bottom_col = C_GREEN if r == max_row else C_GREEN
+            cell.border = Border(
+                left=_side(left_col),
+                right=_side(right_col),
+                top=_side(top_col),
+                bottom=_side(bottom_col),
+            )
+
+    # В шаблоне границы на K7:P7 и колонке J могут быть заданы через темы/условное форматирование.
+    # Здесь не навязываем эти линии, чтобы не "ломать" вид.
+
+    # Сводная таблица: через одну строку после "Итого" (одна пустая строка между ними)
+    ss = itogo_row + 2
+    labels = [
+        "ЧП", "Аморт", "Запасы", "Производство", "Налоги",
+        "незакр прибыль", "незакр расходы", "ФОТ", "Прочее",
+        "ДЗ", "Авансы выданные", "КЗ", "Авансы полученные", "прочее дз", "прочее кз",
+        "ОС", "Финвложения", "Капитал", "Лизинг", "Дивики", "Долг",
+        "CFO", "CFI", "CFF", "CF",
+    ]
+    bold_labels = {"ЧП", "CFO", "CFI", "CFF", "CF"}
+    cf_labels = {"CFO", "CFI", "CFF", "CF"}
+
+    row_of = {label: ss + i for i, label in enumerate(labels)}
+
+    def _cfo_formula() -> str:
+        cats = [
+            "ЧП", "Аморт", "Запасы", "Производство", "Налоги",
+            "ФОТ", "Прочее", "ДЗ", "Авансы выданные", "КЗ",
+            "Авансы полученные", "прочее дз", "прочее кз",
+        ]
+        inner = ",".join(f"C{row_of[c]}" for c in cats)
+        return f"=SUM({inner})+C{row_of['незакр прибыль']}+C{row_of['незакр расходы']}"
+
+    cf_formulas = {
+        "CFO": _cfo_formula(),
+        "CFI": f"=C{row_of['ОС']}",
+        "CFF": f"=C{row_of['Финвложения']}+C{row_of['Долг']}+C{row_of['Дивики']}+C{row_of['Лизинг']}+C{row_of['Капитал']}",
+        "CF": f"=SUM(C{row_of['ЧП']}:C{row_of['Долг']})",
+    }
+
+    num_fmt_cf = "#,##0;(#,##0);-"
+    # Сводная таблица в шаблоне также на Aptos Display 9
+    arial9_bold = base_font_bold
+
+    for label in labels:
+        rr = row_of[label]
+        b = ws.cell(row=rr, column=2)  # B
+        c = ws.cell(row=rr, column=3)  # C
+
+        _safe_set_value(rr, 2, label)
+        b = ws.cell(row=rr, column=2)
+        if isinstance(b, MergedCell):
+            tl = _merge_topleft(rr, 2)
+            if tl:
+                b = ws.cell(row=tl[0], column=tl[1])
+        b.font = base_font_bold if label in bold_labels else base_font
+        b.number_format = num_fmt_cf
+
+        if label in cf_labels:
+            _safe_set_value(rr, 3, cf_formulas[label])
+        else:
+            _safe_set_value(rr, 3, f"=+SUMIFS($M:$M,$N:$N,$B{rr})")
+        c = ws.cell(row=rr, column=3)
+        if isinstance(c, MergedCell):
+            tl = _merge_topleft(rr, 3)
+            if tl:
+                c = ws.cell(row=tl[0], column=tl[1])
+        c.font = arial9_bold
+        c.alignment = right
+        c.number_format = num_fmt_cf
+
+    # Линии: под CFF и над CF (B:C)
+    r_cff = row_of["CFF"]
+    r_cf = row_of["CF"]
+    for col in (2, 3):
+        ws.cell(row=r_cff, column=col).border = Border(bottom=_side(C_BLACK))
+        ws.cell(row=r_cf, column=col).border = Border(top=_side(C_BLACK))
+
+    # Высота строк: 12pt для 6..Итого
+    # Требование: весь лист с высотой строк 12pt.
+    try:
+        ws.sheet_format.defaultRowHeight = 12
+    except Exception:
+        pass
+
+    # Если в файле есть явно заданные высоты строк — переопределяем их на 12.
+    for r in list(ws.row_dimensions.keys()):
+        ws.row_dimensions[r].height = 12
+
+    # Для типичных ОСВ размер листа небольшой, можно проставить высоту всем строкам до max_row.
+    # Но если max_row раздулся форматированием, не делаем дорогой цикл на десятки тысяч строк.
+    max_row = int(ws.max_row or 1)
+    if max_row <= 8000:
+        for r in range(1, max_row + 1):
+            ws.row_dimensions[r].height = 12
+
+    # Группировка/сворачивание: скрываем дочерние строки между "родителями"
+    try:
+        ws.sheet_format.outlineLevelRow = 1
+        ws.sheet_properties.outlinePr.summaryBelow = False
+    except Exception:
+        pass
+
+    for i, prow in enumerate(parent_rows):
+        child_start = prow + 1
+        child_end = (parent_rows[i + 1] if i + 1 < len(parent_rows) else itogo_row) - 1
+        if child_start <= child_end:
+            for rr in range(child_start, child_end + 1):
+                ws.row_dimensions[rr].outlineLevel = 1
+                ws.row_dimensions[rr].hidden = True
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# =========================
 # Интерфейс — стили и тема (без градиентов, фиксированный шрифт)
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
@@ -2739,8 +2995,7 @@ if "prepared_bytes" in st.session_state:
     inv_map = availability.get("inventory_map") or {"1310": False, "1320": False, "1330": False}
     saldo_ok = bool(availability.get("saldo_ok"))
     contracts_ok = bool(availability.get("contracts_ok"))
-
-    st.checkbox("Очистить ОСВ", value=False, disabled=True, help="Скоро")
+    kaz_ok = bool(availability.get("kaz_ok"))
 
     opt_saldo = st.checkbox("Сальдо", value=False, disabled=(not saldo_ok))
     if not saldo_ok:
@@ -2749,6 +3004,10 @@ if "prepared_bytes" in st.session_state:
     opt_contracts = st.checkbox("Контракты", value=False, disabled=(not contracts_ok))
     if not contracts_ok:
         st.caption("Контракты недоступны: не найдены пары листов *Wd/*Md.")
+
+    opt_kaz_obsh = st.checkbox("Обработка общей ОСВ", value=False, disabled=(not kaz_ok))
+    if not kaz_ok:
+        st.caption("Обработка общей ОСВ недоступна: нужны листы «общ» и «Счета каз» в собранном файле.")
 
     inv_available_any = any(bool(v) for v in inv_map.values())
     opt_inventory = st.checkbox("Запасы", value=False, disabled=(not inv_available_any))
@@ -2781,7 +3040,7 @@ if "prepared_bytes" in st.session_state:
     st.write("")
     st.markdown("#### Запуск")
 
-    has_any_mode = bool(selected_modes) or opt_inventory
+    has_any_mode = bool(selected_modes) or opt_inventory or opt_kaz_obsh
     inventory_ok = (not opt_inventory) or bool(inventory_accounts)
     run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok)))
 
@@ -2820,6 +3079,12 @@ if "prepared_bytes" in st.session_state:
                     if inv_report.get("missing_markers"):
                         parts.append("в листах не найден счет в колонке A")
                     st.warning("Запасы: " + "; ".join(parts))
+
+            if opt_kaz_obsh:
+                status_box.info("Обработка: Общая ОСВ…")
+                progress.progress(97)
+                out_bytes = run_code_4_obsh_kaz(out_bytes)
+                progress.progress(99)
 
             st.session_state["processed_bytes"] = out_bytes
             status_box.success("Готово.")
