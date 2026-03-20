@@ -930,12 +930,25 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
     contracts_prefixes = [p for p, d in prefix_to_pair.items() if "wd" in d and "md" in d]
     contracts_ok = bool(contracts_prefixes)
 
+    # Инсайты: нужен набор листов W/M/Wt/Mt (возможно с префиксом).
+    required_ins = {'w','m','wt','mt'}
+    prefix_to_ins: Dict[str, Set[str]] = defaultdict(set)
+    for sh in wb.sheetnames:
+        low = sh.lower()
+        for suf in ('wt','mt','w','m','кред'):
+            if low.endswith(suf):
+                prefix_to_ins[normalize_prefix(sh[:-len(suf)])].add(suf)
+    insights_prefixes = [p for p, s in prefix_to_ins.items() if required_ins.issubset(s)]
+    insights_ok = bool(insights_prefixes)
+
     return {
         "inventory_map": inv_map,
         "saldo_ok": saldo_ok,
         "contracts_ok": contracts_ok,
         "contracts_prefixes": contracts_prefixes,
         "kaz_ok": kaz_ok,
+        "insights_ok": insights_ok,
+        "insights_prefixes": insights_prefixes,
     }
 
 
@@ -2511,8 +2524,23 @@ def run_code_4_obsh_kaz(file_bytes: bytes) -> bytes:
     return out.getvalue()
 
 
+
+
 # =========================
-# Интерфейс — стили и тема (без градиентов, фиксированный шрифт)
+# CODE 5 (Инсайты)
+# Пока базовая версия: создаёт лист `инсайты` и пишет заголовок.
+# Дальше расширим по ТЗ (5 блоков + риски).
+# =========================
+
+def run_code_5_insights(file_bytes: bytes) -> bytes:
+    """????????? ????? `???????` (??. ?????? `insights.py`)."""
+    from insights import generate_insights
+
+    return generate_insights(file_bytes)
+
+
+# =========================
+# ????????? ? ????? ? ???? (??? ??????????, ????????????? ?????)
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
@@ -2996,6 +3024,7 @@ if "prepared_bytes" in st.session_state:
     saldo_ok = bool(availability.get("saldo_ok"))
     contracts_ok = bool(availability.get("contracts_ok"))
     kaz_ok = bool(availability.get("kaz_ok"))
+    insights_ok = bool(availability.get("insights_ok"))
 
     opt_saldo = st.checkbox("Сальдо", value=False, disabled=(not saldo_ok))
     if not saldo_ok:
@@ -3008,6 +3037,10 @@ if "prepared_bytes" in st.session_state:
     opt_kaz_obsh = st.checkbox("Обработка общей ОСВ", value=False, disabled=(not kaz_ok))
     if not kaz_ok:
         st.caption("Обработка общей ОСВ недоступна: нужны листы «общ» и «Счета каз» в собранном файле.")
+
+    opt_insights = st.checkbox("Инсайты", value=False, disabled=(not insights_ok))
+    if not insights_ok:
+        st.caption("Инсайты недоступны: нужны листы W, M, Mt, Wt (и опционально кред).")
 
     inv_available_any = any(bool(v) for v in inv_map.values())
     opt_inventory = st.checkbox("Запасы", value=False, disabled=(not inv_available_any))
@@ -3040,7 +3073,7 @@ if "prepared_bytes" in st.session_state:
     st.write("")
     st.markdown("#### Запуск")
 
-    has_any_mode = bool(selected_modes) or opt_inventory or opt_kaz_obsh
+    has_any_mode = bool(selected_modes) or opt_inventory or opt_kaz_obsh or opt_insights
     inventory_ok = (not opt_inventory) or bool(inventory_accounts)
     run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok)))
 
@@ -3084,6 +3117,12 @@ if "prepared_bytes" in st.session_state:
                 status_box.info("Обработка: Общая ОСВ…")
                 progress.progress(97)
                 out_bytes = run_code_4_obsh_kaz(out_bytes)
+                progress.progress(99)
+
+            if opt_insights:
+                status_box.info("Обработка: Инсайты…")
+                progress.progress(98)
+                out_bytes = run_code_5_insights(out_bytes)
                 progress.progress(99)
 
             st.session_state["processed_bytes"] = out_bytes
