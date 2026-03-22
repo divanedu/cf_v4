@@ -3,6 +3,7 @@ import io
 import time
 import os
 import tempfile
+import zipfile
 from copy import copy as _copy
 from collections import defaultdict
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -26,6 +27,14 @@ def safe_sheet_name(name: str) -> str:
         name = name.replace(ch, "")
     name = (name or "").strip() or "лист"
     return name[:31]
+
+def has_vba_project(file_bytes: bytes) -> bool:
+    """True если в файле есть проект VBA (xlsm). Используем для правильного расширения выходного файла."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            return "xl/vbaProject.bin" in set(zf.namelist())
+    except Exception:
+        return False
 
 
 def safe_filename(name: str) -> str:
@@ -588,7 +597,7 @@ def find_first_row_with_value(ws, value, col: int = 1) -> Optional[int]:
             if int(v) == int(target_raw):
                 return r
             continue
-        s = str(v).replace("\u00A0", " ").replace("\u202F", " ").strip().lower()
+        s = str(v).replace(" ", " ").replace(" ", " ").strip().lower()
         if s == target:
             return r
     return None
@@ -667,7 +676,7 @@ def get_account_number(ws) -> Optional[str]:
         candidates.append(str(tl))
 
     def _normalize(s: str) -> str:
-        s = (s or "").replace("\u00A0", " ").replace("\u202F", " ").strip()
+        s = (s or "").replace(" ", " ").replace(" ", " ").strip()
         return s
 
     def _digits_compact(s: str) -> str:
@@ -681,12 +690,12 @@ def get_account_number(ws) -> Optional[str]:
         idx = s_low.find("счет")
         if idx != -1:
             tail = s_norm[idx:]
-            tail_compact = tail.replace("\u00A0", "").replace("\u202F", "").replace(" ", "")
+            tail_compact = tail.replace(" ", "").replace(" ", "").replace(" ", "")
             m = re.search(r"(\\d{4})", tail_compact)
             if m:
                 return m.group(1)
         # Фолбэк: любые 4 подряд идущие цифры (предварительно "сжимаем" пробелы между цифрами).
-        compact = s_norm.replace("\u00A0", "").replace("\u202F", "").replace(" ", "")
+        compact = s_norm.replace(" ", "").replace(" ", "").replace(" ", "")
         m = re.search(r"(\\d{4})", compact)
         if m:
             return m.group(1)
@@ -719,7 +728,7 @@ def to_number(v) -> Optional[float]:
     s = str(v).strip()
     if not s:
         return None
-    s = s.replace("\u00A0", "").replace("\u202F", "").replace(" ", "")
+    s = s.replace(" ", "").replace(" ", "").replace(" ", "")
     if s.startswith("(") and s.endswith(")"):
         s = "-" + s[1:-1]
     m = _num_re.search(s)
@@ -739,7 +748,7 @@ def _cell_text(v) -> str:
         s = str(v)
     except Exception:
         return ""
-    s = s.replace("\u00A0", " ").replace("\u202F", " ").strip()
+    s = s.replace(" ", " ").replace(" ", " ").strip()
     return s
 
 
@@ -808,7 +817,7 @@ def clean_osv_sheet_inplace(ws) -> Optional[str]:
             v = ws.cell(row=r, column=1).value
             if v is None:
                 continue
-            s = str(v).replace("\u00A0", " ").replace("\u202F", " ").strip().lower()
+            s = str(v).replace(" ", " ").replace(" ", " ").strip().lower()
             if s.startswith("итого"):
                 end_row = r
                 break
@@ -835,7 +844,7 @@ def clean_osv_sheet_inplace(ws) -> Optional[str]:
             v = ws.cell(row=r, column=1).value
             if v is None:
                 continue
-            s = str(v).replace("\u00A0", " ").replace("\u202F", " ").strip().lower()
+            s = str(v).replace(" ", " ").replace(" ", " ").strip().lower()
             if s.startswith("итого"):
                 end_row = r
                 break
@@ -939,7 +948,20 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
             if low.endswith(suf):
                 prefix_to_ins[normalize_prefix(sh[:-len(suf)])].add(suf)
     insights_prefixes = [p for p, s in prefix_to_ins.items() if required_ins.issubset(s)]
-    insights_ok = bool(insights_prefixes)
+
+    # Листы инсайтов уже могут быть в файле и их нельзя перезатирать.
+    # Поэтому считаем доступность как: есть ли хотя бы один префикс-набор, где инсайты ещё НЕ созданы.
+    insights_existing_titles: List[str] = []
+    insights_missing_titles: List[str] = []
+    for pfx in insights_prefixes:
+        base = 'инсайты' if not pfx else f'инсайты {pfx}'
+        title = base[:31]
+        if title in wb.sheetnames:
+            insights_existing_titles.append(title)
+        else:
+            insights_missing_titles.append(title)
+
+    insights_ok = bool(insights_missing_titles)
 
     return {
         "inventory_map": inv_map,
@@ -949,6 +971,8 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
         "kaz_ok": kaz_ok,
         "insights_ok": insights_ok,
         "insights_prefixes": insights_prefixes,
+        "insights_existing_titles": insights_existing_titles,
+        "insights_missing_titles": insights_missing_titles,
     }
 
 
@@ -2528,19 +2552,19 @@ def run_code_4_obsh_kaz(file_bytes: bytes) -> bytes:
 
 # =========================
 # CODE 5 (Инсайты)
-# Пока базовая версия: создаёт лист `инсайты` и пишет заголовок.
-# Дальше расширим по ТЗ (5 блоков + риски).
+# Генерирует лист(ы) «инсайты» на основе W/M/Wt/Mt (и общ/кред при наличии).
+# Реализовано в отдельном модуле `insights.py`.
 # =========================
 
 def run_code_5_insights(file_bytes: bytes) -> bytes:
-    """????????? ????? `???????` (??. ?????? `insights.py`)."""
+    """Генерация листа(ов) «инсайты» (см. модуль `insights.py`)."""
     from insights import generate_insights
 
     return generate_insights(file_bytes)
 
 
 # =========================
-# ????????? ? ????? ? ???? (??? ??????????, ????????????? ?????)
+# Дизайн и тема (фон/цвета, тумблер темы)
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
@@ -3025,22 +3049,20 @@ if "prepared_bytes" in st.session_state:
     contracts_ok = bool(availability.get("contracts_ok"))
     kaz_ok = bool(availability.get("kaz_ok"))
     insights_ok = bool(availability.get("insights_ok"))
-
-    opt_saldo = st.checkbox("Сальдо", value=False, disabled=(not saldo_ok))
-    if not saldo_ok:
-        st.caption("Сальдо недоступно: не найдены листы, заканчивающиеся на 1210/1710/3310/3510.")
-
-    opt_contracts = st.checkbox("Контракты", value=False, disabled=(not contracts_ok))
-    if not contracts_ok:
-        st.caption("Контракты недоступны: не найдены пары листов *Wd/*Md.")
+    insights_existing = availability.get("insights_existing_titles") or []
+    insights_missing = availability.get("insights_missing_titles") or []
 
     opt_kaz_obsh = st.checkbox("Обработка общей ОСВ", value=False, disabled=(not kaz_ok))
     if not kaz_ok:
         st.caption("Обработка общей ОСВ недоступна: нужны листы «общ» и «Счета каз» в собранном файле.")
 
-    opt_insights = st.checkbox("Инсайты", value=False, disabled=(not insights_ok))
-    if not insights_ok:
-        st.caption("Инсайты недоступны: нужны листы W, M, Mt, Wt (и опционально кред).")
+    opt_contracts = st.checkbox("Контракты", value=False, disabled=(not contracts_ok))
+    if not contracts_ok:
+        st.caption("Контракты недоступны: не найдены пары листов *Wd/*Md.")
+
+    opt_saldo = st.checkbox("Сальдо", value=False, disabled=(not saldo_ok))
+    if not saldo_ok:
+        st.caption("Сальдо недоступно: не найдены листы, заканчивающиеся на 1210/1710/3310/3510.")
 
     inv_available_any = any(bool(v) for v in inv_map.values())
     opt_inventory = st.checkbox("Запасы", value=False, disabled=(not inv_available_any))
@@ -3063,6 +3085,17 @@ if "prepared_bytes" in st.session_state:
 
         if not inventory_accounts:
             st.caption("Выберите минимум один счет: 1310 / 1320 / 1330.")
+
+    opt_insights = st.checkbox("Инсайты", value=False, disabled=(not insights_ok))
+    if insights_existing:
+        st.warning("Инсайты уже есть в файле: " + ", ".join(insights_existing) + ". Повторно не генерирую.")
+    if not insights_ok:
+        if insights_existing:
+            st.caption("Инсайты недоступны: для всех найденных префиксов лист «инсайты» уже существует.")
+        else:
+            st.caption("Инсайты недоступны: нужны листы W, M, Mt, Wt (лист «общ» — только для блока 6).")
+    elif insights_missing and insights_existing:
+        st.caption("Будут добавлены только отсутствующие: " + ", ".join(insights_missing) + ".")
 
     selected_modes: List[str] = []
     if opt_saldo:
@@ -3088,23 +3121,29 @@ if "prepared_bytes" in st.session_state:
 
             out_bytes = st.session_state["prepared_bytes"]
 
-            if "Сальдо" in selected_modes:
-                status_box.info("Обработка: Сальдо…")
-                progress.progress(35)
-                out_bytes = run_code_1(out_bytes)
-                progress.progress(55)
+            if opt_kaz_obsh:
+                status_box.info("Обработка: Общая ОСВ…")
+                progress.progress(30)
+                out_bytes = run_code_4_obsh_kaz(out_bytes)
+                progress.progress(40)
 
             if "Контракты" in selected_modes:
                 status_box.info("Обработка: Контракты…")
-                progress.progress(60)
+                progress.progress(45)
                 out_bytes = run_code_2(out_bytes)
-                progress.progress(80)
+                progress.progress(60)
+
+            if "Сальдо" in selected_modes:
+                status_box.info("Обработка: Сальдо…")
+                progress.progress(65)
+                out_bytes = run_code_1(out_bytes)
+                progress.progress(78)
 
             if opt_inventory:
                 status_box.info("Обработка: Запасы…")
                 progress.progress(82)
                 out_bytes, inv_report = run_code_3_inventory(out_bytes, inventory_accounts)
-                progress.progress(95)
+                progress.progress(94)
                 if inv_report.get("missing_sheets") or inv_report.get("missing_markers"):
                     parts = []
                     if inv_report.get("missing_sheets"):
@@ -3113,19 +3152,13 @@ if "prepared_bytes" in st.session_state:
                         parts.append("в листах не найден счет в колонке A")
                     st.warning("Запасы: " + "; ".join(parts))
 
-            if opt_kaz_obsh:
-                status_box.info("Обработка: Общая ОСВ…")
-                progress.progress(97)
-                out_bytes = run_code_4_obsh_kaz(out_bytes)
-                progress.progress(99)
-
             if opt_insights:
                 status_box.info("Обработка: Инсайты…")
-                progress.progress(98)
+                progress.progress(97)
                 out_bytes = run_code_5_insights(out_bytes)
                 progress.progress(99)
-
             st.session_state["processed_bytes"] = out_bytes
+            st.session_state["processed_name"] = st.session_state.get("prepared_name") or "output.xlsx"
             status_box.success("Готово.")
             progress.progress(100)
         except Exception as e:
@@ -3135,7 +3168,21 @@ if "prepared_bytes" in st.session_state:
     st.write("")
     st.markdown("#### Скачать")
     download_bytes = st.session_state.get("processed_bytes") or st.session_state.get("prepared_bytes")
-    download_name = st.session_state.get("prepared_name") or "output.xlsx"
+    download_name = st.session_state.get("processed_name") or st.session_state.get("prepared_name") or "output.xlsx"
+    # Если внутри есть проект VBA, Excel ожидает .xlsm; иначе сохраняем как .xlsx.
+    want_xlsm = bool(download_bytes and has_vba_project(download_bytes))
+    if want_xlsm:
+        if not download_name.lower().endswith(".xlsm"):
+            download_name = re.sub(r"\.(xlsx|xlsm)$", ".xlsm", download_name, flags=re.IGNORECASE)
+            if not download_name.lower().endswith(".xlsm"):
+                download_name += ".xlsm"
+        download_mime = "application/vnd.ms-excel.sheet.macroEnabled.12"
+    else:
+        if not download_name.lower().endswith(".xlsx"):
+            download_name = re.sub(r"\.(xlsx|xlsm)$", ".xlsx", download_name, flags=re.IGNORECASE)
+            if not download_name.lower().endswith(".xlsx"):
+                download_name += ".xlsx"
+        download_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     if not has_any_mode:
         confirm_merge = st.checkbox("Только объединить (без обработок)", value=False)
@@ -3143,7 +3190,7 @@ if "prepared_bytes" in st.session_state:
             label="Скачать",
             data=download_bytes,
             file_name=download_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime=download_mime,
             use_container_width=True,
             disabled=(not confirm_merge),
         )
@@ -3152,6 +3199,6 @@ if "prepared_bytes" in st.session_state:
             label="Скачать",
             data=download_bytes,
             file_name=download_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime=download_mime,
             use_container_width=True,
         )
