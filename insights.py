@@ -1,43 +1,77 @@
 # -*- coding: utf-8 -*-
 """insights.py
 
-Генерация листа `инсайты` — компактный кредитный анализ.
+Минимально-стабильная реализация генерации листа "инсайты".
 
-Вход: книга Excel (bytes) с листами W, M, Mt, Wt (обязательные) и листом `кред` (опционально).
-Выход: те же bytes, но с добавленным/пересозданным листом `инсайты`.
+Цель: убрать проблему с битой кодировкой и всегда писать нормальный русский текст.
+Блоки 1–5 сейчас выводятся в компактном виде (при необходимости расширим).
+Блок 6 делает расчеты по ТЗ и заполняет таблицу + сводку флагов формулами.
 
-Ключевые требования (сокращённо):
-- Минимум текста, формальный стиль, без эмодзи.
-- Форматирование: Calibri 11, числа #,##0, проценты 0.0%, цвета/заливки по ТЗ.
-- Данные после «последнего месяца с реальными данными» игнорируем.
-
-Важно: Листы могут иметь префикс (например, "МW", "МWt", "Мкред" и т.д.).
-Мы выбираем один набор листов для анализа: без префикса, если он есть, иначе первый найденный префикс.
+Вход: bytes Excel (.xlsx/.xlsm) с листами W, M, Wt, Mt и опционально общ/кред.
+Выход: bytes Excel.
 """
 
 from __future__ import annotations
 
 import io
 import re
-from dataclasses import dataclass
+import zipfile
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.utils import get_column_letter
+
+# -------- styles --------
+C_RED = "CC0000"
+C_GREEN = "006600"
+C_ORANGE = "CC8800"
+C_GRAY = "666666"
+
+FILL_HDR = PatternFill("solid", fgColor="D9E1F2")
+FILL_PROB = PatternFill("solid", fgColor="FCE4EC")
+FILL_RISK = PatternFill("solid", fgColor="FFF2CC")
+
+A_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=False)
+A_RIGHT = Alignment(horizontal="right", vertical="center", wrap_text=False)
+A_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+NUM = "#,##0"
+PCT = "0.0%"
+MULT = '0.0"x"'
+
+F_DEF = Font(name="Calibri", size=11)
+F_HDR = Font(name="Calibri", size=11, bold=True)
+F_TITLE = Font(name="Calibri", size=14, bold=True)
+F_GRAY_ITALIC = Font(name="Calibri", size=9, italic=True, color=C_GRAY)
+F_RED_BOLD = Font(name="Calibri", size=11, bold=True, color=C_RED)
+F_GREEN_BOLD = Font(name="Calibri", size=11, bold=True, color=C_GREEN)
+F_ORANGE_BOLD = Font(name="Calibri", size=11, bold=True, color=C_ORANGE)
 
 
-_MONTH_HDR_RE = re.compile(r"^\d{4}_(0[1-9]|1[0-2])$")
+def _detect_keep_vba(file_bytes: bytes) -> bool:
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            return "xl/vbaProject.bin" in set(zf.namelist())
+    except Exception:
+        return False
+
+
+def _load_wb(file_bytes: bytes):
+    return load_workbook(io.BytesIO(file_bytes), data_only=False, keep_vba=_detect_keep_vba(file_bytes))
+
+
+def _save_wb(wb) -> bytes:
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 def _as_text(v) -> str:
-    if v is None:
-        return ""
-    return str(v).strip()
+    return "" if v is None else str(v)
 
 
 def _to_float(v) -> float:
-    """Текст/пусто -> 0. Числа -> float. Скобки (1 234) -> -1234."""
     if v is None:
         return 0.0
     if isinstance(v, (int, float)):
@@ -55,116 +89,30 @@ def _to_float(v) -> float:
         return 0.0
 
 
-def _is_month_header(v) -> bool:
-    return bool(_MONTH_HDR_RE.match(_as_text(v)))
-
-
-def _ym(year: int, month: int) -> str:
-    return f"{year:04d}_{month:02d}"
-
-
-def _normalize_prefix(prefix: str) -> str:
-    # В проекте префиксы обычно буквенные; нормализуем пробелы.
-    return (prefix or "").strip()
-
-
-def _load_wb_from_bytes(file_bytes: bytes) -> "load_workbook":
-    bio = io.BytesIO(file_bytes)
-    return load_workbook(bio)
-
-
-def _pick_first_sheet_by_suffix(sheetnames: Sequence[str], prefix: str, suffix: str) -> str:
-    """Выбираем лист по суффиксу (без учёта регистра), учитывая префикс."""
-    pref = prefix or ""
-    suf_l = suffix.lower()
-
-    # 1) сначала пробуем точное имя
-    for cand in (pref + suffix, pref + suffix.upper(), pref + suffix.lower(), pref + suffix.capitalize()):
-        if cand in sheetnames:
-            return cand
-
-    # 2) иначе первый совпавший по окончанию
-    for sh in sheetnames:
-        low = sh.lower()
-        if not low.endswith(suf_l):
-            continue
-        if pref and not sh.startswith(pref):
-            continue
-        return sh
-
-    raise KeyError(f"Не найден лист с суффиксом {suffix}")
-
-
-def _select_insights_prefix(sheetnames: Sequence[str]) -> str:
-    """Если в книге несколько наборов W/M/Wt/Mt (по префиксам), берём без префикса, иначе первый."""
-    required = {"w", "m", "wt", "mt"}
-    pref_to: Dict[str, set] = {}
-
-    for sh in sheetnames:
-        low = sh.lower()
-        for suf in ("wt", "mt", "w", "m"):
-            if low.endswith(suf):
-                pref = _normalize_prefix(sh[:-len(suf)])
-                pref_to.setdefault(pref, set()).add(suf)
-
-    prefixes = [p for p, s in pref_to.items() if required.issubset(s)]
-    prefixes = sorted(set(prefixes), key=lambda x: (x != "", x))
-    return prefixes[0] if prefixes else ""
-
-
-def _delete_and_create_sheet_first(wb, title: str):
-    if title in wb.sheetnames:
-        del wb[title]
-    ws = wb.create_sheet(title)
+def _to_intish(v) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        return int(v)
+    s = str(v).strip()
+    if not s or s.startswith("="):
+        return None
+    m = re.search(r"-?\d+", s)
+    if not m:
+        return None
     try:
-        wb._sheets.remove(ws)
-        wb._sheets.insert(0, ws)
+        return int(m.group(0))
     except Exception:
-        pass
-    return ws
+        return None
 
 
-def _set_insights_column_widths(ws) -> None:
-    # openpyxl.width — условные "символы", задаём приближённо.
-    ws.column_dimensions["A"].width = 3
-    ws.column_dimensions["B"].width = 60
-    for col in range(column_index_from_string("C"), column_index_from_string("N") + 1):
-        ws.column_dimensions[get_column_letter(col)].width = 12
-    for col in ("C", "D", "E", "F"):
-        ws.column_dimensions[col].width = 18
-
-
-@dataclass
-class Styles:
-    # Цвета
-    red: str = "CC0000"
-    green: str = "006600"
-    orange: str = "CC8800"
-    gray: str = "666666"
-
-    # Заливки
-    fill_hdr: PatternFill = PatternFill("solid", fgColor="D9E1F2")
-    fill_prob: PatternFill = PatternFill("solid", fgColor="FCE4EC")
-    fill_risk: PatternFill = PatternFill("solid", fgColor="FFF2CC")
-    fill_peak: PatternFill = PatternFill("solid", fgColor="E8F5E9")
-    fill_low: PatternFill = PatternFill("solid", fgColor="FDE8E8")
-
-    # Шрифты
-    f_def: Font = Font(name="Calibri", size=11)
-    f_hdr: Font = Font(name="Calibri", size=11, bold=True)
-    f_title: Font = Font(name="Calibri", size=14, bold=True)
-    f_italic_gray_small: Font = Font(name="Calibri", size=9, italic=True, color="666666")
-
-    # Выравнивания
-    a_left: Alignment = Alignment(horizontal="left", vertical="center")
-    a_right: Alignment = Alignment(horizontal="right", vertical="center")
-    a_center: Alignment = Alignment(horizontal="center", vertical="center")
-
-
-def _write_row(ws, r: int, values: Sequence[object], *, font: Optional[Font] = None, fill: Optional[PatternFill] = None,
-               align: Optional[Alignment] = None, num_fmt: Optional[str] = None, font_color: Optional[str] = None,
-               start_col: int = 2) -> None:
-    """Пишем строку, начиная с колонки B по умолчанию."""
+def _write_row(ws, r: int, values: Sequence[object], *, start_col: int = 2,
+               font: Optional[Font] = None, fill: Optional[PatternFill] = None,
+               align: Optional[Alignment] = None, num_fmt: Optional[str] = None):
     for i, v in enumerate(values):
         c = ws.cell(row=r, column=start_col + i, value=v)
         if font is not None:
@@ -175,710 +123,1177 @@ def _write_row(ws, r: int, values: Sequence[object], *, font: Optional[Font] = N
             c.alignment = align
         if num_fmt is not None:
             c.number_format = num_fmt
-        if font_color is not None:
-            base = c.font
-            c.font = Font(name=base.name, size=base.size, bold=base.bold, italic=base.italic, color=font_color)
 
 
-def _iter_month_rows(ws, start_row: int, year_col: int, month_col: int) -> Iterable[Tuple[int, int, int]]:
-    """Итерируем помесячные строки: пока год остаётся числом (строки 12+)."""
+def _set_cell(ws, r: int, c: int, v=None, *, font: Optional[Font] = None,
+              fill: Optional[PatternFill] = None, align: Optional[Alignment] = None,
+              num_fmt: Optional[str] = None):
+    cell = ws.cell(row=r, column=c)
+    if v is not None:
+        cell.value = v
+    if font is not None:
+        cell.font = font
+    if fill is not None:
+        cell.fill = fill
+    if align is not None:
+        cell.alignment = align
+    if num_fmt is not None:
+        cell.number_format = num_fmt
+    return cell
+
+
+# -------- period parsing (общ!A2) --------
+_MONTHS = {
+    "январь": 1, "января": 1,
+    "февраль": 2, "февраля": 2,
+    "март": 3, "марта": 3,
+    "апрель": 4, "апреля": 4,
+    "май": 5, "мая": 5,
+    "июнь": 6, "июня": 6,
+    "июль": 7, "июля": 7,
+    "август": 8, "августа": 8,
+    "сентябрь": 9, "сентября": 9,
+    "октябрь": 10, "октября": 10,
+    "ноябрь": 11, "ноября": 11,
+    "декабрь": 12, "декабря": 12,
+}
+
+
+def _parse_obsh_period_from_a2(a2: str) -> Optional[Tuple[int, int, int, int, str]]:
+    s = _as_text(a2)
+    if not s:
+        return None
+    s_low = s.lower()
+    if "за" in s_low:
+        s2 = s[s_low.find("за") + 2 :].strip()
+    else:
+        s2 = s.strip()
+    s2 = s2.replace("г.", "").replace("г", "").strip(" .")
+
+    m = re.fullmatch(r"(\d{4})", s2.strip())
+    if m:
+        y = int(m.group(1))
+        return y, 1, y, 12, s2
+
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})\s*[-–]\s*(\d{2})\.(\d{2})\.(\d{4})", s2)
+    if m:
+        m0, y0 = int(m.group(2)), int(m.group(3))
+        m1, y1 = int(m.group(5)), int(m.group(6))
+        return y0, m0, y1, m1, s2
+
+    m = re.search(r"([а-я]+)\s+(\d{4})\s*[-–]\s*([а-я]+)\s+(\d{4})", s2, flags=re.I)
+    if m:
+        m0s, y0 = m.group(1).lower(), int(m.group(2))
+        m1s, y1 = m.group(3).lower(), int(m.group(4))
+        if m0s in _MONTHS and m1s in _MONTHS:
+            return y0, _MONTHS[m0s], y1, _MONTHS[m1s], s2
+
+    m = re.search(r"([а-я]+)\s+(\d{4})", s2, flags=re.I)
+    if m:
+        ms, y = m.group(1).lower(), int(m.group(2))
+        if ms in _MONTHS:
+            mm = _MONTHS[ms]
+            return y, mm, y, mm, s2
+
+    m = re.search(r"(\d{4})", s2)
+    if m:
+        y = int(m.group(1))
+        return y, 1, y, 12, s2
+
+    return None
+
+
+def _month_iter(y0: int, m0: int, y1: int, m1: int) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    y, m = y0, m0
+    while (y < y1) or (y == y1 and m <= m1):
+        out.append((y, m))
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
+    return out
+
+
+def _fmt_period_short(y0: int, m0: int, y1: int, m1: int) -> str:
+    if y0 == y1 and m0 == m1:
+        return f"{m0:02d}.{y0}"
+    return f"{m0:02d}.{y0} – {m1:02d}.{y1}"
+
+
+def _ym_key(ym: Tuple[int, int]) -> int:
+    return ym[0] * 12 + ym[1]
+
+
+def _iter_month_rows(ws, *, start_row: int, year_col: int, month_col: int) -> Iterable[Tuple[int, int, int]]:
     r = start_row
     max_r = int(ws.max_row or 1)
     while r <= max_r:
-        y = ws.cell(row=r, column=year_col).value
-        if y is None or _as_text(y) == "":
+        y = _to_intish(ws.cell(row=r, column=year_col).value)
+        if y is None:
             break
-        if not isinstance(y, (int, float)):
-            break
-        m = ws.cell(row=r, column=month_col).value
-        if not isinstance(m, (int, float)):
+        m = _to_intish(ws.cell(row=r, column=month_col).value)
+        if m is None or not (1 <= m <= 12):
             break
         yield r, int(y), int(m)
         r += 1
 
 
-@dataclass
-class WRow:
-    ym: str
-    cfo: float
-    clients: float
-    pers: float
-    taxes: float
+def _m_revenue_value(ws_m, rr: int) -> float:
+    g = ws_m.cell(row=rr, column=7).value
+    if isinstance(g, (int, float)):
+        return float(g)
+    return sum(_to_float(ws_m.cell(row=rr, column=c).value) for c in (17, 18, 19))
 
 
-def parse_w_sheet(ws_w) -> List[WRow]:
-    """Парсим W: строки 12+, фиксированные колонки (B,C,F,G,R,S)."""
-    rows: List[WRow] = []
+def _sum_m_revenue_for_period(ws_m, months: List[Tuple[int, int]], *, times_1000: bool) -> float:
+    want = {f"{y:04d}_{m:02d}" for (y, m) in months}
+    total = 0.0
+    for rr, y, m in _iter_month_rows(ws_m, start_row=12, year_col=2, month_col=3):
+        if f"{y:04d}_{m:02d}" in want:
+            total += _m_revenue_value(ws_m, rr)
+    return total * (1000.0 if times_1000 else 1.0)
+
+
+def _sum_w_cfo_for_period(ws_w, months: List[Tuple[int, int]]) -> float:
+    want = {f"{y:04d}_{m:02d}" for (y, m) in months}
+    total = 0.0
+    for rr, y, m in _iter_month_rows(ws_w, start_row=12, year_col=2, month_col=3):
+        if f"{y:04d}_{m:02d}" in want:
+            total += _to_float(ws_w.cell(row=rr, column=6).value)
+    return total
+
+
+def _last_real_month_m(ws_m) -> Optional[Tuple[int, int]]:
+    last = None
+    for rr, y, m in _iter_month_rows(ws_m, start_row=12, year_col=2, month_col=3):
+        if abs(_m_revenue_value(ws_m, rr)) > 0:
+            last = (y, m)
+    return last
+
+
+def _last_real_month_w(ws_w) -> Optional[Tuple[int, int]]:
+    last = None
     for rr, y, m in _iter_month_rows(ws_w, start_row=12, year_col=2, month_col=3):
         cfo = _to_float(ws_w.cell(row=rr, column=6).value)
         clients = _to_float(ws_w.cell(row=rr, column=7).value)
-        pers = _to_float(ws_w.cell(row=rr, column=18).value)
-        taxes = _to_float(ws_w.cell(row=rr, column=19).value)
-        rows.append(WRow(ym=_ym(y, m), cfo=cfo, clients=clients, pers=pers, taxes=taxes))
+        if abs(cfo) > 0 or abs(clients) > 0:
+            last = (y, m)
+    return last
 
-    # Последний месяц = последний, где CFO != 0 или Клиенты != 0
-    last = -1
-    for i in range(len(rows) - 1, -1, -1):
-        if abs(rows[i].cfo) > 0 or abs(rows[i].clients) > 0:
-            last = i
+
+def _parse_obsh_accounts(ws_obsh) -> Tuple[Dict[str, Dict[str, float]], Optional[int]]:
+    acc: Dict[str, Dict[str, float]] = {}
+    itogo_row: Optional[int] = None
+    max_r = int(ws_obsh.max_row or 1)
+    for r in range(6, max_r + 1):
+        a = _as_text(ws_obsh.cell(row=r, column=1).value).strip()
+        if not a:
+            continue
+        if a.strip().lower() == "итого":
+            itogo_row = r
             break
-    return rows[: last + 1] if last >= 0 else rows
+        m = re.match(r'^"?(\d{4})', a)
+        if not m:
+            continue
+        code = m.group(1)
+        acc[code] = {
+            "E": _to_float(ws_obsh.cell(row=r, column=5).value),
+            "F": _to_float(ws_obsh.cell(row=r, column=6).value),
+            "G": _to_float(ws_obsh.cell(row=r, column=7).value),
+            "H": _to_float(ws_obsh.cell(row=r, column=8).value),
+        }
+    return acc, itogo_row
 
 
-@dataclass
-class MRow:
-    ym: str
-    rev: float
+
+# =============================================================================
+# Blocks 1-5 (по ТЗ)
+# =============================================================================
+
+FILL_HIGH = PatternFill("solid", fgColor="E8F5E9")
+FILL_LOW  = PatternFill("solid", fgColor="FDE8E8")
 
 
-def parse_m_sheet(ws_m) -> List[MRow]:
-    """Парсим M: строки 12+, используем только реальные месяцы (A=1), выручка G."""
-    tmp: List[Tuple[str, int, float]] = []
-    for rr, y, m in _iter_month_rows(ws_m, start_row=12, year_col=2, month_col=3):
-        flag = ws_m.cell(row=rr, column=1).value
-        flag = int(flag) if isinstance(flag, (int, float)) else 0
-        rev = _to_float(ws_m.cell(row=rr, column=7).value)
-        tmp.append((_ym(y, m), flag, rev))
-
-    real = [MRow(ym=ym, rev=rev) for (ym, flag, rev) in tmp if flag == 1]
-
-    # Последний реальный месяц = последний, где rev != 0
-    last = -1
-    for i in range(len(real) - 1, -1, -1):
-        if abs(real[i].rev) > 0:
-            last = i
-            break
-    return real[: last + 1] if last >= 0 else real
+def _period(y: int, m: int) -> str:
+    return f"{y:04d}_{m:02d}"
 
 
-@dataclass
-class TableEntry:
-    name: str
-    total: float
+def _is_next_month(prev: Tuple[int, int], cur: Tuple[int, int]) -> bool:
+    py, pm = prev
+    cy, cm = cur
+    return (cy == py and cm == pm + 1) or (cy == py + 1 and pm == 12 and cm == 1)
 
 
-@dataclass
-class ParsedTable:
-    name: str
-    header_row: int
-    total_row: Optional[int]
-    month_cols: List[int]  # колонки месяцев (C..)
-    grand_total_col: int
-    entries: List[TableEntry]
-
-
-def _find_grand_total_col(ws, header_row: int, start_col: int = 3, fallback: str = "AC") -> int:
-    max_c = int(ws.max_column or 1)
-    for c in range(start_col, min(max_c, 120) + 1):
-        hv = _as_text(ws.cell(row=header_row, column=c).value).lower()
-        if hv in ("итог", "итого"):
-            return c
-    return column_index_from_string(fallback)
-
-
-def _read_month_cols(ws, header_row: int, first_month_col: int = 3, limit: int = 60) -> List[int]:
-    cols: List[int] = []
-    max_c = min(int(ws.max_column or 1), limit)
-    c = first_month_col
-    while c <= max_c and _is_month_header(ws.cell(row=header_row, column=c).value):
-        cols.append(c)
-        c += 1
-    return cols
-
-
-def parse_wt_like_tables(
+def _parse_tables_generic(
     ws,
-    start_row: int,
     *,
-    allowed_names: Optional[set] = None,
-    excluded_names: Optional[set] = None,
-    skip_row_names: Optional[set] = None,
-) -> List[ParsedTable]:
-    """Универсальный парсер таблиц Wt/кред.
+    start_row: int,
+    name_col: int,
+    first_month_col: int,
+    total_col: int,
+    header_month: str = "2025_01",
+    include_tables: Optional[set[str]] = None,
+    exclude_tables: Optional[set[str]] = None,
+    skip_names: Optional[set[str]] = None,
+) -> List[dict]:
+    """Парсинг блок-таблиц Wt/кред.
 
-    Заголовок таблицы: B непусто и C = '2025_01'.
-    Конец таблицы: строка, где B = 'Доля'.
-    Контрагенты: строки между заголовком и 'Доля', кроме Топ/Всего/Доля.
+    Заголовок таблицы: (B непусто) и (C == '2025_01').
+    Контрагенты: строки до 'Доля', исключая Топ/Всего/Доля и (в кред) Тело/Проценты/Платежи.
     """
-    allowed = allowed_names
-    excluded = excluded_names or set()
-    skip = skip_row_names or set()
 
-    out: List[ParsedTable] = []
+    if skip_names is None:
+        skip_names = {"Топ", "Всего", "Доля", "Тело", "Проценты", "Платежи", ""}
 
+    out: List[dict] = []
     r = start_row
     max_r = int(ws.max_row or 1)
+
     while r <= max_r:
-        tname = _as_text(ws.cell(row=r, column=2).value)
-        first_month = ws.cell(row=r, column=3).value
-        if tname and _is_month_header(first_month):
-            if (allowed is None or tname in allowed) and tname not in excluded:
-                gt_col = _find_grand_total_col(ws, r)
-                month_cols = _read_month_cols(ws, r)
+        tbl_name = _as_text(ws.cell(row=r, column=name_col).value).strip()
+        first_month = _as_text(ws.cell(row=r, column=first_month_col).value).strip()
 
-                entries: List[TableEntry] = []
-                total_row: Optional[int] = None
-
+        if tbl_name and tbl_name not in skip_names and (first_month == header_month or re.match(r"^\d{4}_\d{2}$", first_month)):
+            if include_tables is not None and tbl_name not in include_tables:
                 rr = r + 1
-                while rr <= max_r:
-                    nm = _as_text(ws.cell(row=rr, column=2).value)
-                    if nm == "Доля":
-                        break
-                    if nm == "Всего":
-                        total_row = rr
-                    if nm and nm not in skip and nm not in {"Топ", "Всего", "Доля"}:
-                        tot = _to_float(ws.cell(row=rr, column=gt_col).value)
-                        entries.append(TableEntry(name=nm, total=tot))
+                while rr <= max_r and _as_text(ws.cell(row=rr, column=name_col).value).strip() != "Доля":
                     rr += 1
+                r = rr + 3
+                continue
 
-                out.append(
-                    ParsedTable(
-                        name=tname,
-                        header_row=r,
-                        total_row=total_row,
-                        month_cols=month_cols,
-                        grand_total_col=gt_col,
-                        entries=entries,
-                    )
-                )
+            if exclude_tables is not None and tbl_name in exclude_tables:
+                rr = r + 1
+                while rr <= max_r and _as_text(ws.cell(row=rr, column=name_col).value).strip() != "Доля":
+                    rr += 1
+                r = rr + 3
+                continue
 
+            cps: List[dict] = []
+            rr = r + 1
+            while rr <= max_r:
+                nm = _as_text(ws.cell(row=rr, column=name_col).value).strip()
+                if nm == "Доля":
+                    break
+                if nm and nm not in skip_names:
+                    total = _to_float(ws.cell(row=rr, column=total_col).value)
+                    cps.append({"name": nm, "total": total})
+                rr += 1
+
+            if cps:
+                out.append({"name": tbl_name, "counterparties": cps})
+
+            r = rr + 3
+        else:
             r += 1
-            continue
-
-        r += 1
 
     return out
 
 
-@dataclass
-class MtParsed:
-    total_all: float
-    entries: List[TableEntry]
-    header_row: int
-    total_row: Optional[int]
-    grand_total_col: int
+def _write_block1(ws, row: int, *, ws_wt, ws_cred=None) -> int:
+    _write_row(ws, row, ["1. ПЕРЕСЕЧЕНИЯ КОНТРАГЕНТОВ (Wt / кред)"], font=F_HDR, align=A_LEFT)
+    row += 1
+    _write_row(ws, row, ["Контрагенты, присутствующие в 2+ таблицах"], font=F_GRAY_ITALIC, align=A_LEFT)
+    row += 1
+    _write_row(ws, row, ["Контрагент", "Лист", "Таблица", "Направление", "Итого"], font=F_HDR, fill=FILL_HDR, align=A_LEFT)
+    row += 1
+
+    wt_excl = {"Прочая ДЗ/КЗ Inflow", "Прочая ДЗ/КЗ Outflow"}
+    wt_tables = _parse_tables_generic(ws_wt, start_row=3, name_col=2, first_month_col=3, total_col=29, exclude_tables=wt_excl)
+
+    cred_tables: List[dict] = []
+    if ws_cred is not None:
+        cred_include = {"Краткосрочные кредиты (Netto)", "Долгосрочные кредиты (Netto)"}
+        cred_tables = _parse_tables_generic(ws_cred, start_row=5, name_col=2, first_month_col=3, total_col=29, include_tables=cred_include)
+
+    occ: Dict[str, List[Tuple[str, str, float]]] = {}
+    for t in wt_tables:
+        for cp in t["counterparties"]:
+            occ.setdefault(cp["name"], []).append(("Wt", t["name"], float(cp["total"])))
+    for t in cred_tables:
+        for cp in t["counterparties"]:
+            occ.setdefault(cp["name"], []).append(("кред", t["name"], float(cp["total"])))
+
+    inter: Dict[str, List[Tuple[str, str, float]]] = {}
+    for name, items in occ.items():
+        uniq = {(sh, tbl) for (sh, tbl, _) in items}
+        if len(uniq) >= 2:
+            inter[name] = items
+
+    if not inter:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        return row + 3
+
+    company_tbls = {
+        "Клиенты",
+        "Пост-ки",
+        "Прочая ДЗ/КЗ",
+        "Прочие займы",
+        "Краткосрочные кредиты (Netto)",
+        "Долгосрочные кредиты (Netto)",
+    }
+    people_tbls = {"Подотчет", "3350", "73(&)"}
+
+    companies: List[str] = []
+    persons: List[str] = []
+
+    for name, items in inter.items():
+        tbls = {tbl for _, tbl, _ in items}
+        if tbls.issubset(people_tbls):
+            persons.append(name)
+        elif tbls & company_tbls:
+            companies.append(name)
+        else:
+            companies.append(name)
+
+    def write_group(names: List[str], *, sep: Optional[str] = None) -> None:
+        nonlocal row
+        if not names:
+            return
+        if sep:
+            _write_row(ws, row, [sep], font=F_GRAY_ITALIC, align=A_LEFT)
+            row += 1
+        for nm in sorted(names):
+            items = inter[nm]
+            first = True
+            for sh, tbl, total in items:
+                direction = "Приход" if total >= 0 else "Расход"
+                _write_row(ws, row, [nm if first else "", sh, tbl, direction, total], align=A_LEFT)
+                ws.cell(row=row, column=6).number_format = NUM
+                ws.cell(row=row, column=6).font = F_GREEN_BOLD if total >= 0 else F_RED_BOLD
+                first = False
+                row += 1
+
+    write_group(companies)
+    write_group(persons, sep="Физические лица (подотчет + персонал):")
+
+    return row + 2
 
 
-def parse_mt(ws_mt) -> MtParsed:
-    hdr = 5
-    name_col = 2
-    gt_col = _find_grand_total_col(ws_mt, hdr)
+def _write_block2(ws, row: int, *, ws_m) -> int:
+    _write_row(ws, row, ["2. РЕГУЛЯРНОСТЬ ВЫРУЧКИ (M)"], font=F_HDR, align=A_LEFT)
+    row += 1
 
-    entries: List[TableEntry] = []
-    r = hdr + 1
-    max_r = int(ws_mt.max_row or 1)
-    stop = {"Топ", "Всего", "Доля"}
-    while r <= max_r:
-        nm = _as_text(ws_mt.cell(row=r, column=name_col).value)
-        if not nm:
-            r += 1
+    rows: List[Tuple[int, int, int, float]] = []
+    for rr, y, m in _iter_month_rows(ws_m, start_row=12, year_col=2, month_col=3):
+        rows.append((rr, y, m, float(_m_revenue_value(ws_m, rr))))
+
+    if not rows:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        return row + 3
+
+    last_idx = None
+    for i, (_rr, _y, _m, v) in enumerate(rows):
+        if abs(v) > 0:
+            last_idx = i
+    if last_idx is None:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        return row + 3
+
+    rows = rows[: last_idx + 1]
+
+    nonzero = [v for *_rest, v in rows if v > 0]
+    if not nonzero:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        return row + 3
+
+    avg = sum(nonzero) / len(nonzero)
+    thr = 0.10 * avg
+
+    # breaks
+    breaks: List[Tuple[str, str, int]] = []
+    cur_start: Optional[Tuple[int, int]] = None
+    cur_len = 0
+    prev_ym: Optional[Tuple[int, int]] = None
+
+    for (_rr, y, m, v) in rows:
+        ym = (y, m)
+        low = v < thr
+        if low:
+            if cur_start is None:
+                cur_start = ym
+                cur_len = 1
+            else:
+                if prev_ym is not None and _is_next_month(prev_ym, ym):
+                    cur_len += 1
+                else:
+                    breaks.append((_period(*cur_start), _period(*prev_ym), cur_len))
+                    cur_start = ym
+                    cur_len = 1
+        else:
+            if cur_start is not None and prev_ym is not None:
+                breaks.append((_period(*cur_start), _period(*prev_ym), cur_len))
+                cur_start = None
+                cur_len = 0
+        prev_ym = ym
+
+    if cur_start is not None and prev_ym is not None:
+        breaks.append((_period(*cur_start), _period(*prev_ym), cur_len))
+
+    if not breaks:
+        _write_row(ws, row, ["Перерывов не выявлено"], font=F_GREEN_BOLD, align=A_LEFT)
+        row += 1
+    else:
+        for b0, b1, ln in breaks:
+            _write_row(ws, row, [f"Перерывы: {b0} — {b1} ({ln} мес. выручка < порога)"], font=F_HDR, align=A_LEFT)
+            row += 1
+
+    # anomalies
+    revs = [v for *_rest, v in rows]
+    yms = [(y, m) for (_rr, y, m, _v) in rows]
+    probs: List[Tuple[str, float, float, str]] = []
+
+    for i in range(1, len(revs)):
+        prev_vals = revs[max(0, i - 3) : i]
+        avg3 = sum(prev_vals) / len(prev_vals) if prev_vals else 0.0
+        if avg3 <= 0:
             continue
-        if nm in stop:
+        v = revs[i]
+        if v == 0 and avg3 > 0:
+            probs.append((_period(*yms[i]), v, avg3, "Нулевая выручка"))
+        elif v < 0.3 * avg3:
+            pct = int(round((1 - (v / avg3)) * 100))
+            probs.append((_period(*yms[i]), v, avg3, f"Падение {pct}%"))
+
+    if probs:
+        _write_row(ws, row, ["Период", "Выручка", "Ср. 3 мес.", "Статус"], font=F_HDR, fill=FILL_HDR, align=A_LEFT)
+        row += 1
+        for per, v, a3, st in probs:
+            _write_row(ws, row, [per, v, a3, st], align=A_LEFT)
+            ws.cell(row=row, column=3).number_format = NUM
+            ws.cell(row=row, column=4).number_format = NUM
+            ws.cell(row=row, column=5).font = F_RED_BOLD
+            row += 1
+    else:
+        _write_row(ws, row, ["Проблемных месяцев не выявлено"], font=F_GREEN_BOLD, align=A_LEFT)
+        row += 1
+
+    return row + 2
+
+
+def _write_block3(ws, row: int, *, ws_w) -> int:
+    _write_row(ws, row, ["3. РЕГУЛЯРНОСТЬ ПЕРСОНАЛА И НАЛОГОВ (W)"], font=F_HDR, align=A_LEFT)
+    row += 1
+    _write_row(ws, row, ["Аномалии: падение >50% от скользящего среднего за 3 мес."], font=F_GRAY_ITALIC, align=A_LEFT)
+    row += 1
+
+    rows: List[Tuple[int, int, int, float, float, float, float]] = []
+    for rr, y, m in _iter_month_rows(ws_w, start_row=12, year_col=2, month_col=3):
+        cfo = _to_float(ws_w.cell(row=rr, column=6).value)
+        clients = _to_float(ws_w.cell(row=rr, column=7).value)
+        pers = _to_float(ws_w.cell(row=rr, column=18).value)   # R
+        taxes = _to_float(ws_w.cell(row=rr, column=19).value)  # S
+        rows.append((rr, y, m, cfo, clients, pers, taxes))
+
+    if not rows:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        return row + 3
+
+    last_idx = None
+    for i, (_rr, _y, _m, cfo, clients, *_rest) in enumerate(rows):
+        if abs(cfo) > 0 or abs(clients) > 0:
+            last_idx = i
+    if last_idx is None:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        return row + 3
+
+    rows = rows[: last_idx + 1]
+    yms = [(y, m) for (_rr, y, m, *_rest) in rows]
+    pers_vals = [pers for (*_a, pers, _t) in rows]
+    tax_vals = [taxes for (*_a, _p, taxes) in rows]
+
+    def anomalies(vals: List[float]) -> List[Tuple[str, float, float, str]]:
+        out: List[Tuple[str, float, float, str]] = []
+        for i in range(1, len(vals)):
+            prev_vals = vals[max(0, i - 3) : i]
+            avg3 = sum(prev_vals) / len(prev_vals) if prev_vals else 0.0
+            if avg3 <= 1000:
+                continue
+            v = vals[i]
+            if v == 0:
+                out.append((_period(*yms[i]), v, avg3, "Нулевой платеж"))
+            elif v < 0.5 * avg3:
+                pct = int(round((1 - (v / avg3)) * 100))
+                out.append((_period(*yms[i]), v, avg3, f"Падение {pct}%"))
+        return out
+
+    # Personnel
+    _write_row(ws, row, ["Персонал"], font=F_HDR, align=A_LEFT)
+    row += 1
+    pers_an = anomalies(pers_vals)
+    if not pers_an:
+        _write_row(ws, row, ["Аномалий не выявлено"], font=F_GREEN_BOLD, align=A_LEFT)
+        row += 1
+    else:
+        _write_row(ws, row, ["Период", "Сумма", "Ср. 3 мес.", "Статус"], font=F_HDR, fill=FILL_PROB, align=A_LEFT)
+        row += 1
+        for per, v, a3, st in pers_an:
+            _write_row(ws, row, [per, v, a3, st], align=A_LEFT)
+            ws.cell(row=row, column=3).number_format = NUM
+            ws.cell(row=row, column=4).number_format = NUM
+            ws.cell(row=row, column=5).font = F_RED_BOLD
+            row += 1
+
+    # Taxes
+    _write_row(ws, row, ["Налоги"], font=F_HDR, align=A_LEFT)
+    row += 1
+    tax_an = anomalies(tax_vals)
+    if not tax_an:
+        _write_row(ws, row, ["Аномалий не выявлено"], font=F_GREEN_BOLD, align=A_LEFT)
+        row += 1
+    else:
+        _write_row(ws, row, ["Период", "Сумма", "Ср. 3 мес.", "Статус"], font=F_HDR, fill=FILL_PROB, align=A_LEFT)
+        row += 1
+        for per, v, a3, st in tax_an:
+            _write_row(ws, row, [per, v, a3, st], align=A_LEFT)
+            ws.cell(row=row, column=3).number_format = NUM
+            ws.cell(row=row, column=4).number_format = NUM
+            ws.cell(row=row, column=5).font = F_RED_BOLD
+            row += 1
+
+    return row + 2
+
+
+def _parse_mt(ws_mt) -> Tuple[List[Tuple[str, float]], float]:
+    cps: List[Tuple[str, float]] = []
+    total = 0.0
+    max_r = int(ws_mt.max_row or 1)
+
+    for r in range(6, max_r + 1):
+        name = _as_text(ws_mt.cell(row=r, column=2).value).strip()
+        if not name:
             break
-        entries.append(TableEntry(name=nm, total=_to_float(ws_mt.cell(row=r, column=gt_col).value)))
+        if name == "Всего":
+            total = _to_float(ws_mt.cell(row=r, column=29).value)
+            break
+        if name in {"Топ", "Доля"}:
+            break
+        cps.append((name, _to_float(ws_mt.cell(row=r, column=29).value)))
+
+    if total == 0.0:
+        for r in range(6, max_r + 1):
+            name = _as_text(ws_mt.cell(row=r, column=2).value).strip()
+            if name == "Всего":
+                total = _to_float(ws_mt.cell(row=r, column=29).value)
+                break
+
+    return cps, total
+
+
+def _find_wt_table(ws_wt, table_name: str) -> Optional[int]:
+    max_r = int(ws_wt.max_row or 1)
+    for r in range(3, max_r + 1):
+        nm = _as_text(ws_wt.cell(row=r, column=2).value).strip()
+        first = _as_text(ws_wt.cell(row=r, column=3).value).strip()
+        if nm == table_name and re.match(r"^\d{4}_\d{2}$", first):
+            return r
+    return None
+
+
+def _parse_wt_clients(ws_wt) -> Tuple[List[Tuple[str, float]], float, List[float], List[float]]:
+    """Контрагенты + итоги по таблице 'Клиенты' на Wt."""
+    header_r = _find_wt_table(ws_wt, "Клиенты")
+    if header_r is None:
+        return [], 0.0, [0.0] * 12, [0.0] * 12
+
+    cps: List[Tuple[str, float]] = []
+    total_all = 0.0
+    max_r = int(ws_wt.max_row or 1)
+
+    r = header_r + 1
+    while r <= max_r:
+        nm = _as_text(ws_wt.cell(row=r, column=2).value).strip()
+        if nm in {"Топ", "Всего", "Доля", ""}:
+            break
+        cps.append((nm, _to_float(ws_wt.cell(row=r, column=29).value)))
         r += 1
 
-    total_all = 0.0
-    total_row = None
-    for rr in range(hdr + 1, min(max_r, hdr + 400) + 1):
-        if _as_text(ws_mt.cell(row=rr, column=name_col).value) == "Всего":
-            total_all = _to_float(ws_mt.cell(row=rr, column=gt_col).value)
-            total_row = rr
+    rr = header_r + 1
+    while rr <= max_r:
+        nm = _as_text(ws_wt.cell(row=rr, column=2).value).strip()
+        if nm == "Всего":
+            total_all = _to_float(ws_wt.cell(row=rr, column=29).value)
+            m2025 = [_to_float(ws_wt.cell(row=rr, column=c).value) for c in range(3, 15)]   # C..N
+            m2026 = [_to_float(ws_wt.cell(row=rr, column=c).value) for c in range(15, 27)]  # O..Z
+            return cps, total_all, m2025, m2026
+        if nm == "Доля":
             break
+        rr += 1
 
-    return MtParsed(total_all=total_all, entries=entries, header_row=hdr, total_row=total_row, grand_total_col=gt_col)
-
-
-def last_month_col_by_total_row(ws, header_row: int, total_row: int, month_cols: List[int]) -> Optional[int]:
-    """Для таблиц: справа налево ищем последний месяц, где в строке 'Всего' != 0."""
-    if not total_row or not month_cols:
-        return None
-    for c in reversed(month_cols):
-        if abs(_to_float(ws.cell(row=total_row, column=c).value)) > 0:
-            return c
-    return month_cols[-1]
+    return cps, total_all, [0.0] * 12, [0.0] * 12
 
 
-# =========================
-# Генератор листа `инсайты`
-# =========================
+def _write_block4(ws, row: int, *, ws_mt, ws_wt) -> int:
+    _write_row(ws, row, ["4. КОНЦЕНТРАЦИЯ КЛИЕНТОВ"], font=F_HDR, align=A_LEFT)
+    row += 1
+
+    # Mt
+    _write_row(ws, row, ["Выручка (Mt)"], font=F_HDR, align=A_LEFT)
+    row += 1
+    cps, total = _parse_mt(ws_mt)
+    if total <= 0:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        row += 2
+    else:
+        cps_sorted = sorted(cps, key=lambda x: x[1], reverse=True)
+        _write_row(ws, row, ["Клиент", "Сумма", "Доля"], font=F_HDR, fill=FILL_HDR, align=A_LEFT)
+        row += 1
+        for nm, v in cps_sorted:
+            _write_row(ws, row, [nm, v, (v / total) if total else 0], align=A_LEFT)
+            ws.cell(row=row, column=3).number_format = NUM
+            ws.cell(row=row, column=4).number_format = "0.0%"
+            if total and (v / total) > 0.70:
+                ws.cell(row=row, column=4).font = F_RED_BOLD
+            row += 1
+        top_nm, top_v = cps_sorted[0]
+        share = (top_v / total) if total else 0.0
+        if share > 0.70:
+            _write_row(ws, row, [f"ВЫСОКАЯ КОНЦЕНТРАЦИЯ: {share:.1%} выручки — один клиент ({top_nm})"], font=F_HDR, align=A_LEFT)
+            row += 1
+        elif share > 0.50:
+            _write_row(ws, row, [f"ЗНАЧИТЕЛЬНАЯ КОНЦЕНТРАЦИЯ: {share:.1%} выручки — один клиент ({top_nm})"], font=F_ORANGE_BOLD, align=A_LEFT)
+            row += 1
+        _write_row(ws, row, [f"Всего клиентов: {len(cps_sorted)}"], font=F_DEF, align=A_LEFT)
+        row += 2
+
+    # Wt
+    _write_row(ws, row, ["Поступления от клиентов (Wt)"], font=F_HDR, align=A_LEFT)
+    row += 1
+    wt_cps, wt_total, _m25, _m26 = _parse_wt_clients(ws_wt)
+    if wt_total <= 0:
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        row += 1
+    else:
+        wt_sorted = sorted(wt_cps, key=lambda x: x[1], reverse=True)
+        _write_row(ws, row, ["Клиент", "Сумма", "Доля"], font=F_HDR, fill=FILL_HDR, align=A_LEFT)
+        row += 1
+        for nm, v in wt_sorted:
+            _write_row(ws, row, [nm, v, (v / wt_total) if wt_total else 0], align=A_LEFT)
+            ws.cell(row=row, column=3).number_format = NUM
+            ws.cell(row=row, column=4).number_format = "0.0%"
+            if wt_total and (v / wt_total) > 0.70:
+                ws.cell(row=row, column=4).font = F_RED_BOLD
+            row += 1
+        top_nm, top_v = wt_sorted[0]
+        share = (top_v / wt_total) if wt_total else 0.0
+        if share > 0.70:
+            _write_row(ws, row, [f"ВЫСОКАЯ КОНЦЕНТРАЦИЯ: {share:.1%} поступлений — один клиент ({top_nm})"], font=F_HDR, align=A_LEFT)
+            row += 1
+        elif share > 0.50:
+            _write_row(ws, row, [f"ЗНАЧИТЕЛЬНАЯ КОНЦЕНТРАЦИЯ: {share:.1%} поступлений — один клиент ({top_nm})"], font=F_ORANGE_BOLD, align=A_LEFT)
+            row += 1
+        _write_row(ws, row, [f"Всего клиентов: {len(wt_sorted)}"], font=F_DEF, align=A_LEFT)
+        row += 1
+
+    return row + 2
+
+
+def _write_block5(ws, row: int, *, ws_wt) -> int:
+    _write_row(ws, row, ["5. СЕЗОННОСТЬ ПОСТУПЛЕНИЙ ОТ КЛИЕНТОВ (Wt)"], font=F_HDR, align=A_LEFT)
+    row += 1
+
+    _cps, _tot, m2025, m2026 = _parse_wt_clients(ws_wt)
+    if not any(abs(v) > 0 for v in m2025):
+        _write_row(ws, row, ["Данных нет"], font=F_GRAY_ITALIC, align=A_LEFT)
+        return row + 3
+
+    avg = sum(m2025) / 12.0
+    peaks = [i + 1 for i, v in enumerate(m2025) if v > 1.5 * avg]
+    lows = [i + 1 for i, v in enumerate(m2025) if v < 0.3 * avg]
+
+    last26 = 0
+    for i, v in enumerate(m2026, start=1):
+        if abs(v) > 0:
+            last26 = i
+
+    peaks_s = ", ".join(str(x) for x in peaks) if peaks else "—"
+    lows_s = ", ".join(str(x) for x in lows) if lows else "—"
+
+    _write_row(ws, row, [f"Среднее за 2025: {int(round(avg)):,} / мес. Пиковые: {peaks_s}. Провалы: {lows_s}".replace(",", " ")], font=F_GRAY_ITALIC, align=A_LEFT)
+    row += 1
+
+    months_ru = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+    _write_row(ws, row, months_ru, font=F_HDR, fill=FILL_HDR, align=A_CENTER)
+    row += 1
+
+    _set_cell(ws, row, 2, "2025", font=F_HDR, align=A_CENTER)
+    for i, v in enumerate(m2025, start=1):
+        c = ws.cell(row=row, column=2 + i)
+        c.value = v
+        c.number_format = NUM
+        c.alignment = A_CENTER
+        if i in lows:
+            c.fill = FILL_LOW
+            c.font = F_RED_BOLD
+        if i in peaks:
+            c.fill = FILL_HIGH
+            c.font = F_GREEN_BOLD
+    row += 1
+
+    _set_cell(ws, row, 2, "2026", font=F_HDR, align=A_CENTER)
+    for i, v in enumerate(m2026, start=1):
+        c = ws.cell(row=row, column=2 + i)
+        c.alignment = A_CENTER
+        if last26 and i > last26:
+            c.value = ""
+            c.font = Font(name="Calibri", size=11, color="CCCCCC")
+        else:
+            c.value = v
+            c.number_format = NUM
+    row += 1
+
+    _set_cell(ws, row, 2, "Ср. мес.", font=Font(name="Calibri", size=11, bold=True, italic=True, color=C_GRAY), align=A_CENTER)
+    for i in range(1, 13):
+        c = ws.cell(row=row, column=2 + i)
+        c.value = avg
+        c.number_format = NUM
+        c.font = Font(name="Calibri", size=11, italic=True, color=C_GRAY)
+        c.alignment = A_CENTER
+    row += 1
+
+    nonzero25 = [v for v in m2025 if v > 0]
+    if nonzero25:
+        mn = min(nonzero25)
+        mx = max(nonzero25)
+        spread = (mx / mn) if mn else 0.0
+        _write_row(ws, row, [f"Поступления крайне неравномерны: мин. {int(round(mn)):,}, макс. {int(round(mx)):,} — разброс в {spread:.1f}x".replace(",", " ")], font=F_ORANGE_BOLD, align=A_LEFT)
+        row += 1
+
+    if lows:
+        _write_row(ws, row, ["Риск кассового разрыва в периоды низких поступлений при сохранении фиксированных расходов"], font=F_HDR, align=A_LEFT)
+        row += 1
+
+    return row + 2
+
+
+
+
+
+def _write_block6(ws, row: int, *, ws_obsh, ws_m, ws_w) -> int:
+    STOP = "\u0421\u0422\u041e\u041f-\u0424\u0410\u041a\u0422\u041e\u0420"
+    RED  = "\u041a\u0420\u0410\u0421\u041d\u042b\u0419 \u0424\u041b\u0410\u0413"
+    YEL  = "\u0416\u0401\u041b\u0422\u042b\u0419 \u0424\u041b\u0410\u0413"
+    POS  = "\u041f\u041e\u0417\u0418\u0422\u0418\u0412"
+
+    p = _parse_obsh_period_from_a2(_as_text(ws_obsh["A2"].value)) if ws_obsh is not None else None
+    if p is None:
+        years = [y for _, y, _ in _iter_month_rows(ws_m, start_row=12, year_col=2, month_col=3)]
+        yy = max(years) if years else 2025
+        y0, m0, y1, m1, raw = yy, 1, yy, 12, str(yy)
+    else:
+        y0, m0, y1, m1, raw = p
+
+    period_short = _fmt_period_short(y0, m0, y1, m1)
+    months = _month_iter(y0, m0, y1, m1)
+
+    last_m = _last_real_month_m(ws_m)
+    last_w = _last_real_month_w(ws_w)
+    last_common = last_m or last_w
+    if last_m and last_w:
+        last_common = last_m if _ym_key(last_m) <= _ym_key(last_w) else last_w
+    if last_common:
+        months = [ym for ym in months if _ym_key(ym) <= _ym_key(last_common)]
+
+    acc_map, itogo_row = ({}, None)
+    if ws_obsh is not None:
+        acc_map, itogo_row = _parse_obsh_accounts(ws_obsh)
+
+    def end_db(code: str) -> float:
+        return float((acc_map.get(code) or {}).get("G", 0.0) or 0.0)
+
+    def end_cr(code: str) -> float:
+        return float((acc_map.get(code) or {}).get("H", 0.0) or 0.0)
+
+    def turn_db(code: str) -> float:
+        return float((acc_map.get(code) or {}).get("E", 0.0) or 0.0)
+
+    def turn_cr(code: str) -> float:
+        return float((acc_map.get(code) or {}).get("F", 0.0) or 0.0)
+
+    balance_currency = 0.0
+    if ws_obsh is not None and itogo_row is not None:
+        balance_currency = _to_float(ws_obsh.cell(row=itogo_row, column=7).value)
+
+    revenue_for_ratios = _sum_m_revenue_for_period(ws_m, months, times_1000=True)
+    revenue_period_ths = _sum_m_revenue_for_period(ws_m, months, times_1000=False)
+    cfo_period_ths = _sum_w_cfo_for_period(ws_w, months)
+
+    base_year = int(y0)
+    prev_year = base_year - 1
+
+    def sum_m_year_ths(year: int) -> float:
+        tot = 0.0
+        for rr, y, m in _iter_month_rows(ws_m, start_row=12, year_col=2, month_col=3):
+            if y == year:
+                tot += _m_revenue_value(ws_m, rr)
+        return tot
+
+    rev_base = sum_m_year_ths(base_year) * 1000.0
+    rev_prev = sum_m_year_ths(prev_year) * 1000.0
+
+    rev_6010 = turn_cr("6010")
+    cogs_7010 = turn_db("7010")
+    sga_7110 = turn_db("7110")
+    ga_7210 = turn_db("7210")
+    op_profit = rev_6010 - cogs_7010 - sga_7110 - ga_7210
+
+    oa_codes = ["1030", "1050", "1060", "1100", "1210", "1250", "1270", "1300", "1400", "1710", "1720", "1730"]
+    ko_codes = ["3010", "3100", "3200", "3300", "3400", "3500"]
+
+    _write_row(ws, row, ["6. \u0424\u0418\u041d\u0410\u041d\u0421\u041e\u0412\u042b\u0415 \u041f\u041e\u041a\u0410\u0417\u0410\u0422\u0415\u041b\u0418 \u0418 \u0424\u041b\u0410\u0413\u0418 (\u043e\u0431\u0449 / M / W)"], font=F_HDR, align=A_LEFT)
+    row += 1
+    _write_row(ws, row, [f"\u041e\u0421\u0412 \u0437\u0430 {raw}. \u0412\u044b\u0440\u0443\u0447\u043a\u0430 \u0434\u043b\u044f \u043a\u043e\u044d\u0444\u0444\u0438\u0446\u0438\u0435\u043d\u0442\u043e\u0432 \u2014 \u0438\u0437 M \u0437\u0430 \u0442\u043e\u0442 \u0436\u0435 \u043f\u0435\u0440\u0438\u043e\u0434 (\u00d71000, \u0442\u0433)"], font=Font(name="Calibri", size=9, italic=True), align=A_LEFT)
+    row += 2
+    _write_row(ws, row, ["\u041f\u043e\u043a\u0430\u0437\u0430\u0442\u0435\u043b\u044c", "\u0421\u0447\u0451\u0442 / \u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a", "\u0417\u043d\u0430\u0447\u0435\u043d\u0438\u0435", "\u041a\u043e\u044d\u0444\u0444\u0438\u0446\u0438\u0435\u043d\u0442", "\u0424\u043b\u0430\u0433"], font=F_HDR, fill=FILL_HDR, align=A_LEFT)
+    row += 1
+
+    equity_row = row
+    _set_cell(ws, row, 2, "\u041a\u0430\u043f\u0438\u0442\u0430\u043b (Equity)", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 3, "5030 + 5600", font=F_DEF, align=A_LEFT)
+    row += 1
+    r5030 = row
+    _set_cell(ws, row, 2, "\u0423\u0441\u0442\u0430\u0432\u043d\u044b\u0439 \u043a\u0430\u043f\u0438\u0442\u0430\u043b", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "5030", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_cr("5030")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+    r5600 = row
+    _set_cell(ws, row, 2, "\u041d\u0435\u0440\u0430\u0441\u043f\u0440\u0435\u0434. \u043f\u0440\u0438\u0431\u044b\u043b\u044c", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "5600", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_cr("5600")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, equity_row, 4, f"=SUM(D{r5030}:D{r5600})", font=F_HDR, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, equity_row, 6, f"=IF(D{equity_row}<0,\"{STOP}\",\"OK\")", font=F_HDR, align=A_LEFT)
+    row += 2
+
+    bal_row = row
+    _set_cell(ws, row, 2, "\u0412\u0430\u043b\u044e\u0442\u0430 \u0431\u0430\u043b\u0430\u043d\u0441\u0430", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 3, "\u0418\u0442\u043e\u0433\u043e", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(balance_currency), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    vb_ratio_row = row
+    _set_cell(ws, row, 2, "\u0412\u0430\u043b\u044e\u0442\u0430 \u0431\u0430\u043b\u0430\u043d\u0441\u0430 / \u0412\u044b\u0440\u0443\u0447\u043a\u0430", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "\u0412\u0411 (\u043e\u0431\u0449) / \u0412\u044b\u0440\u0443\u0447\u043a\u0430 (M\u00d71000)", font=F_DEF, align=A_LEFT)
+    rev_rat_row = row + 1
+    _set_cell(ws, row, 5, f"=IF(D{rev_rat_row}=0,\"N/A\",D{bal_row}/D{rev_rat_row})", font=F_DEF, align=A_RIGHT, num_fmt=MULT)
+    _set_cell(ws, row, 6, f"=IF(E{vb_ratio_row}=\"N/A\",\"\",IF(E{vb_ratio_row}<1,\"{YEL}\",\"OK\"))", font=F_DEF, align=A_LEFT)
+    row += 1
+
+    _set_cell(ws, row, 2, "\u0412\u044b\u0440\u0443\u0447\u043a\u0430 \u0434\u043b\u044f \u043a\u043e\u044d\u0444\u0444\u0438\u0446\u0438\u0435\u043d\u0442\u043e\u0432", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, f"M (\u0432\u044b\u0440\u0443\u0447\u043a\u0430 {period_short}) \u00d71000", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(revenue_for_ratios), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 2
+
+    _set_cell(ws, row, 2, "\u0414\u043e\u043b\u0433\u043e\u0432\u0430\u044f \u043d\u0430\u0433\u0440\u0443\u0437\u043a\u0430", font=F_HDR, align=A_LEFT)
+    row += 1
+
+    debt_row = row
+    _set_cell(ws, row, 2, "\u041e\u0431\u0449\u0438\u0439 \u0434\u043e\u043b\u0433 (3010+4010)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "3010 + 4010", font=F_DEF, align=A_LEFT)
+    row += 1
+
+    r3010 = row
+    _set_cell(ws, row, 2, "  \u041a\u0440\u0430\u0442\u043a\u043e\u0441\u0440\u043e\u0447\u043d\u044b\u0439 \u0434\u043e\u043b\u0433", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "3010", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_cr("3010")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    r4010 = row
+    _set_cell(ws, row, 2, "  \u0414\u043e\u043b\u0433\u043e\u0441\u0440\u043e\u0447\u043d\u044b\u0439 \u0434\u043e\u043b\u0433", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "4010", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_cr("4010")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, debt_row, 4, f"=SUM(D{r3010}:D{r4010})", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    debt_eq_row = row
+    _set_cell(ws, row, 2, "\u0414\u043e\u043b\u0433 / \u041a\u0430\u043f\u0438\u0442\u0430\u043b", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 5, f"=IF(D{equity_row}=0,\"N/A\",D{debt_row}/D{equity_row})", font=F_HDR, align=A_RIGHT, num_fmt=MULT)
+    _set_cell(ws, row, 6, f"=IF(E{debt_eq_row}=\"N/A\",\"\",IF(E{debt_eq_row}>10,\"{RED}\",\"OK\"))", font=F_DEF, align=A_LEFT)
+    row += 1
+
+    sh_debt_row = row
+    _set_cell(ws, row, 2, "\u041a\u0440\u0430\u0442\u043a. \u0434\u043e\u043b\u0433 / \u041a\u0430\u043f\u0438\u0442\u0430\u043b", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "3010 / \u041a\u0430\u043f\u0438\u0442\u0430\u043b", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=D{r3010}", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, row, 5, f"=IF(D{equity_row}=0,\"N/A\",D{r3010}/D{equity_row})", font=F_HDR, align=A_RIGHT, num_fmt=MULT)
+    _set_cell(ws, row, 6, f"=IF(E{sh_debt_row}=\"N/A\",\"\",IF(E{sh_debt_row}>10,\"{YEL}\",\"OK\"))", font=F_DEF, align=A_LEFT)
+    row += 2
+
+    dz_row = row
+    _set_cell(ws, row, 2, "\u0414\u0417 \u043f\u043e\u043a\u0443\u043f\u0430\u0442\u0435\u043b\u0435\u0439 (1210+1730)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "1210 + 1730", font=F_DEF, align=A_LEFT)
+    row += 1
+
+    dz_1210_row = row
+    _set_cell(ws, row, 2, "  1210", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "1210", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_db("1210")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    dz_1730_row = row
+    _set_cell(ws, row, 2, "  1730", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "1730", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_db("1730")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+
+    _set_cell(ws, dz_row, 4, f"=SUM(D{dz_1210_row}:D{dz_1730_row})", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, dz_row, 5, f"=IF(D{rev_rat_row}=0,\"N/A\",D{dz_row}/D{rev_rat_row})", font=F_DEF, align=A_RIGHT, num_fmt=PCT)
+    _set_cell(ws, dz_row, 6, f"=IF(E{dz_row}=\"N/A\",\"\",IF(E{dz_row}>0.5,\"{RED}\",IF(E{dz_row}>0.3,\"{YEL}\",\"OK\")))", font=F_DEF, align=A_LEFT)
+    row += 1
+
+    kz_row = row
+    _set_cell(ws, row, 2, "\u041a\u0417 \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a\u0430\u043c (3310)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "3310", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_cr("3310")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, row, 5, f"=IF(D{rev_rat_row}=0,\"N/A\",D{kz_row}/D{rev_rat_row})", font=F_DEF, align=A_RIGHT, num_fmt=PCT)
+    _set_cell(ws, row, 6, "OK", font=F_HDR, align=A_LEFT)
+    row += 1
+
+    advg_row = row
+    _set_cell(ws, row, 2, "\u0410\u0432\u0430\u043d\u0441\u044b \u0432\u044b\u0434\u0430\u043d\u043d\u044b\u0435 (1710)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "1710", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_db("1710")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, row, 5, f"=IF(D{rev_rat_row}=0,\"N/A\",D{advg_row}/D{rev_rat_row})", font=F_DEF, align=A_RIGHT, num_fmt=PCT)
+    _set_cell(ws, row, 6, f"=IF(E{advg_row}=\"N/A\",\"\",IF(E{advg_row}>0.5,\"{RED}\",IF(E{advg_row}>0.3,\"{YEL}\",\"OK\")))", font=F_DEF, align=A_LEFT)
+    row += 1
+
+    advr_row = row
+    _set_cell(ws, row, 2, "\u0410\u0432\u0430\u043d\u0441\u044b \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043d\u044b\u0435 (3510)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "3510", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_cr("3510")), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, row, 5, f"=IF(D{rev_rat_row}=0,\"N/A\",D{advr_row}/D{rev_rat_row})", font=F_DEF, align=A_RIGHT, num_fmt=PCT)
+    _set_cell(ws, row, 6, "OK", font=F_HDR, align=A_LEFT)
+    row += 2
+
+    chok_row = row
+    _set_cell(ws, row, 2, "\u041e\u0431\u043e\u0440\u043e\u0442\u043d\u044b\u0439 \u043a\u0430\u043f\u0438\u0442\u0430\u043b (\u0427\u041e\u041a)", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 3, "\u041e\u0410 \u2212 \u041a\u041e", font=F_DEF, align=A_LEFT)
+    row += 1
+
+    oa_row = row
+    _set_cell(ws, row, 2, "  \u041e\u0431\u043e\u0440\u043e\u0442\u043d\u044b\u0435 \u0430\u043a\u0442\u0438\u0432\u044b", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, 0, font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    oa_acc_rows = []
+    for code in oa_codes:
+        rr = row
+        _set_cell(ws, rr, 2, f"    {code}", font=F_DEF, align=A_LEFT)
+        _set_cell(ws, rr, 3, code, font=F_DEF, align=A_LEFT)
+        _set_cell(ws, rr, 4, round(end_db(code)), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+        oa_acc_rows.append(rr)
+        row += 1
+
+    _set_cell(ws, oa_row, 4, "=SUM(" + ",".join(f"D{r}" for r in oa_acc_rows) + ")", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+
+    ko_row = row
+    _set_cell(ws, row, 2, "  \u041a\u0440\u0430\u0442\u043a\u043e\u0441\u0440\u043e\u0447\u043d\u044b\u0435 \u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u044c\u0441\u0442\u0432\u0430", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, 0, font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    ko_acc_rows = []
+    for code in ko_codes:
+        rr = row
+        _set_cell(ws, rr, 2, f"    {code}", font=F_DEF, align=A_LEFT)
+        _set_cell(ws, rr, 3, code, font=F_DEF, align=A_LEFT)
+        _set_cell(ws, rr, 4, round(end_cr(code)), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+        ko_acc_rows.append(rr)
+        row += 1
+
+    _set_cell(ws, ko_row, 4, "=SUM(" + ",".join(f"D{r}" for r in ko_acc_rows) + ")", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+
+    _set_cell(ws, chok_row, 4, f"=D{oa_row}-D{ko_row}", font=F_HDR, align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, chok_row, 6, f"=IF(D{chok_row}<0,\"{STOP}\",\"OK\")", font=F_HDR, align=A_LEFT)
+    row += 2
+
+    _set_cell(ws, row, 2, "P&L (\u043e\u0431\u0449 / M)", font=F_HDR, align=A_LEFT)
+    row += 1
+
+    rev_obsh_row = row
+    _set_cell(ws, row, 2, "\u0412\u044b\u0440\u0443\u0447\u043a\u0430 (\u0438\u0437 \u043e\u0431\u0449)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, "6010", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(rev_6010), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    rev_base_row = row
+    _set_cell(ws, row, 2, f"\u0412\u044b\u0440\u0443\u0447\u043a\u0430 {base_year} (M)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, f"M (G, \u0441\u0443\u043c\u043c\u0430 {base_year})", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(rev_base), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    rev_prev_row = row
+    _set_cell(ws, row, 2, f"\u0412\u044b\u0440\u0443\u0447\u043a\u0430 {prev_year} (M)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, f"M (G, \u0441\u0443\u043c\u043c\u0430 {prev_year})", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(rev_prev), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    yoy_row = row
+    _set_cell(ws, row, 2, "\u0414\u0438\u043d\u0430\u043c\u0438\u043a\u0430 YoY", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 3, f"{base_year} vs {prev_year}", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 5, f"=IF(D{rev_prev_row}=0,\"N/A\",D{rev_base_row}/D{rev_prev_row}-1)", font=F_HDR, align=A_RIGHT, num_fmt=PCT)
+    _set_cell(ws, row, 6, f"=IF(E{yoy_row}=\"N/A\",\"\",IF(E{yoy_row}<-0.3,\"{STOP}\",IF(E{yoy_row}<-0.1,\"{RED}\",IF(E{yoy_row}<0,\"{YEL}\",\"OK\"))))", font=F_DEF, align=A_LEFT)
+    row += 2
+
+    op_margin_row = row
+    _set_cell(ws, row, 2, "\u041e\u043f\u0435\u0440\u0430\u0446\u0438\u043e\u043d\u043d\u0430\u044f \u0440\u0435\u043d\u0442\u0430\u0431\u0435\u043b\u044c\u043d\u043e\u0441\u0442\u044c", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 3, "(6010\u22127010\u22127110\u22127210)/6010", font=F_DEF, align=A_LEFT)
+    op_profit_row = row + 1
+    _set_cell(ws, row, 5, f"=IF(D{rev_obsh_row}=0,\"N/A\",D{op_profit_row}/D{rev_obsh_row})", font=F_HDR, align=A_RIGHT, num_fmt=PCT)
+    _set_cell(ws, row, 6, f"=IF(E{op_margin_row}=\"N/A\",\"\",IF(E{op_margin_row}<=0.02,\"{RED}\",\"OK\"))", font=F_DEF, align=A_LEFT)
+    row += 1
+    _set_cell(ws, row, 2, "  \u041e\u043f\u0435\u0440\u0430\u0446\u0438\u043e\u043d\u043d\u0430\u044f \u043f\u0440\u0438\u0431\u044b\u043b\u044c", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(op_profit), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 2
+
+    cfo_ratio_row = row
+    _set_cell(ws, row, 2, f"CFO / \u0412\u044b\u0440\u0443\u0447\u043a\u0430 (\u0437\u0430 {period_short})", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 3, "W (CFO) / M (\u0412\u044b\u0440\u0443\u0447\u043a\u0430)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 5, f"=IF(D{row+2}=0,\"N/A\",D{row+1}/D{row+2})", font=F_HDR, align=A_RIGHT, num_fmt=PCT)
+    _set_cell(ws, row, 6, f"=IF(E{cfo_ratio_row}=\"N/A\",\"\",IF(E{cfo_ratio_row}>0.5,\"{POS}\",IF(E{cfo_ratio_row}>=0.2,\"OK\",IF(E{cfo_ratio_row}<0,\"{RED}\",\"{YEL}\"))))", font=F_DEF, align=A_LEFT)
+    row += 1
+    _set_cell(ws, row, 2, "  CFO (\u0442\u044b\u0441. \u0442\u0435\u043d\u0433\u0435)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(cfo_period_ths), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+    _set_cell(ws, row, 2, f"  \u0412\u044b\u0440\u0443\u0447\u043a\u0430 {period_short} (\u0442\u044b\u0441. \u0442\u0435\u043d\u0433\u0435)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(revenue_period_ths), font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 2
+
+    _write_row(ws, row, ["\u0420\u0410\u0421\u0427\u0401\u0422 \u041b\u0418\u041c\u0418\u0422\u0410"], font=F_HDR, fill=FILL_RISK, align=A_LEFT)
+    row += 1
+
+    lim5_row = row
+    _set_cell(ws, row, 2, "  5% \u00d7 \u0412\u044b\u0440\u0443\u0447\u043a\u0430", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=0.05*D{rev_rat_row}", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    lim10_row = row
+    _set_cell(ws, row, 2, "  10% \u00d7 \u0412\u0430\u043b\u044e\u0442\u0430 \u0431\u0430\u043b\u0430\u043d\u0441\u0430", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=0.10*D{bal_row}", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    _set_cell(ws, row, 2, "  \u041a\u0430\u043f\u0438\u0442\u0430\u043b", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=D{equity_row}", font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    min_row = row
+    _set_cell(ws, row, 2, "  min(\u043b\u0438\u043c\u0438\u0442\u044b)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=MIN(D{lim5_row},D{lim10_row},D{equity_row})", font=F_HDR, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    minus3010_row = row
+    _set_cell(ws, row, 2, "  (\u2212) \u041a\u0440\u0430\u0442\u043a\u043e\u0441\u0440\u043e\u0447\u043d\u044b\u0439 \u0434\u043e\u043b\u0433 (3010)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=-D{r3010}", font=F_HDR, align=A_RIGHT, num_fmt=NUM)
+    row += 1
+
+    lease_row = row
+    _set_cell(ws, row, 2, "  (\u2212) \u041b\u0438\u0437\u0438\u043d\u0433 (4150/7)", font=F_DEF, align=A_LEFT)
+    _set_cell(ws, row, 4, round(end_cr("4150") / 7.0) if end_cr("4150") else 0, font=F_DEF, align=A_RIGHT, num_fmt=NUM)
+    row += 2
+
+    limit_total_row = row
+    _set_cell(ws, row, 2, "  \u041b\u0418\u041c\u0418\u0422 \u0418\u0422\u041e\u0413\u041e", font=Font(name="Calibri", size=12, bold=True), align=A_LEFT)
+    _set_cell(ws, row, 4, f"=D{min_row}+D{minus3010_row}-D{lease_row}", font=Font(name="Calibri", size=12, bold=True), align=A_RIGHT, num_fmt=NUM)
+    _set_cell(ws, row, 6, f"=IF(D{limit_total_row}<0,\"{STOP}\",\"\")", font=Font(name="Calibri", size=12, bold=True), align=A_LEFT)
+    row += 2
+    _write_row(ws, row, ["\u0421\u0412\u041e\u0414\u041a\u0410 \u0424\u041b\u0410\u0413\u041e\u0412", "", "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430", "\u0417\u043d\u0430\u0447\u0435\u043d\u0438\u0435", "\u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442"], font=F_HDR, fill=FILL_HDR, align=A_LEFT)
+    row += 1
+
+    summary_start = row
+
+    def _sum_row(cat, check, value_formula, yes_formula, *, cat_color, fill_yes=None, num_fmt=None):
+        nonlocal row
+        _set_cell(ws, row, 2, cat, font=Font(name="Calibri", size=11, bold=True), align=A_LEFT)
+        _set_cell(ws, row, 4, check, font=F_DEF, align=A_LEFT)
+        _set_cell(ws, row, 5, value_formula, font=F_DEF, align=A_RIGHT, num_fmt=num_fmt)
+        _set_cell(ws, row, 6, f"=IF({yes_formula},\"\u0414\u0410\",\"\u041d\u0415\u0422\")", font=F_HDR, align=A_CENTER)
+        if fill_yes is not None:
+            ws.cell(row=row, column=6).fill = fill_yes
+        row += 1
+
+    _sum_row("\u0421\u0422\u041e\u041f", "\u041e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043a\u0430\u043f\u0438\u0442\u0430\u043b", f"=D{equity_row}", f"D{equity_row}<0", cat_color=C_RED, num_fmt=NUM)
+    _sum_row("\u0421\u0422\u041e\u041f", "\u041f\u0430\u0434\u0435\u043d\u0438\u0435 \u0432\u044b\u0440\u0443\u0447\u043a\u0438 >30%", f"=E{yoy_row}", f"AND(E{yoy_row}<>\"N/A\",E{yoy_row}<-0.3)", cat_color=C_RED, num_fmt=PCT)
+    _sum_row("\u0421\u0422\u041e\u041f", "\u041e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u043b\u0438\u043c\u0438\u0442", f"=D{limit_total_row}", f"D{limit_total_row}<0", cat_color=C_RED, num_fmt=NUM)
+
+    _sum_row("\u041a\u0420\u0410\u0421\u041d\u042b\u0419", "\u041e\u043f. \u0440\u0435\u043d\u0442\u0430\u0431\u0435\u043b\u044c\u043d\u043e\u0441\u0442\u044c \u2264 2%", f"=E{op_margin_row}", f"AND(E{op_margin_row}<>\"N/A\",E{op_margin_row}<=0.02)", cat_color=C_RED, num_fmt=PCT)
+    _sum_row("\u041a\u0420\u0410\u0421\u041d\u042b\u0419", "\u0414\u043e\u043b\u0433/\u041a\u0430\u043f\u0438\u0442\u0430\u043b >10x", f"=E{debt_eq_row}", f"AND(E{debt_eq_row}<>\"N/A\",E{debt_eq_row}>10)", cat_color=C_RED, num_fmt=MULT)
+
+    _sum_row("\u0416\u0401\u041b\u0422\u042b\u0419", "\u041a\u0440\u0430\u0442\u043a. \u0434\u043e\u043b\u0433/\u041a\u0430\u043f\u0438\u0442\u0430\u043b >10", f"=E{sh_debt_row}", f"AND(E{sh_debt_row}<>\"N/A\",E{sh_debt_row}>10)", cat_color=C_ORANGE, num_fmt=MULT)
+    _sum_row("\u0416\u0401\u041b\u0422\u042b\u0419", "\u0414\u0417 / \u0412\u044b\u0440\u0443\u0447\u043a\u0430 >30%", f"=E{dz_row}", f"AND(E{dz_row}<>\"N/A\",E{dz_row}>0.3)", cat_color=C_ORANGE, num_fmt=PCT)
+    _sum_row("\u0416\u0401\u041b\u0422\u042b\u0419", "\u0410\u0432\u0430\u043d\u0441\u044b \u0432\u044b\u0434\u0430\u043d\u043d\u044b\u0435 >30% \u0432\u044b\u0440\u0443\u0447\u043a\u0438", f"=E{advg_row}", f"AND(E{advg_row}<>\"N/A\",E{advg_row}>0.3)", cat_color=C_ORANGE, num_fmt=PCT)
+    _sum_row("\u0416\u0401\u041b\u0422\u042b\u0419", "\u041e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 \u0427\u041e\u041a", f"=D{chok_row}", f"D{chok_row}<0", cat_color=C_ORANGE, num_fmt=NUM)
+
+    _sum_row("\u041f\u041e\u0417\u0418\u0422\u0418\u0412", "CFO / \u0412\u044b\u0440\u0443\u0447\u043a\u0430 > 50%", f"=E{cfo_ratio_row}", f"AND(E{cfo_ratio_row}<>\"N/A\",E{cfo_ratio_row}>0.5)", cat_color=C_GREEN, num_fmt=PCT)
+
+    summary_end = row - 1
+
+    row += 1
+
+    stop_cnt_row = row
+    _set_cell(ws, row, 2, "\u0421\u0442\u043e\u043f-\u0444\u0430\u043a\u0442\u043e\u0440\u043e\u0432:", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=COUNTIFS(B{summary_start}:B{summary_end},\"\u0421\u0422\u041e\u041f\",F{summary_start}:F{summary_end},\"\u0414\u0410\")", font=F_HDR, align=A_RIGHT)
+    row += 1
+
+    red_cnt_row = row
+    _set_cell(ws, row, 2, "\u041a\u0440\u0430\u0441\u043d\u044b\u0445 \u0444\u043b\u0430\u0433\u043e\u0432:", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=COUNTIFS(B{summary_start}:B{summary_end},\"\u041a\u0420\u0410\u0421\u041d\u042b\u0419\",F{summary_start}:F{summary_end},\"\u0414\u0410\")", font=F_HDR, align=A_RIGHT)
+    row += 1
+
+    yellow_cnt_row = row
+    _set_cell(ws, row, 2, "\u0416\u0451\u043b\u0442\u044b\u0445 \u0444\u043b\u0430\u0433\u043e\u0432:", font=F_HDR, align=A_LEFT)
+    _set_cell(ws, row, 4, f"=COUNTIFS(B{summary_start}:B{summary_end},\"\u0416\u0401\u041b\u0422\u042b\u0419\",F{summary_start}:F{summary_end},\"\u0414\u0410\")", font=F_HDR, align=A_RIGHT)
+    row += 1
+
+    x_ref = f"D{stop_cnt_row}"
+    y_ref = f"D{red_cnt_row}"
+    z_ref = f"D{yellow_cnt_row}"
+    _set_cell(ws, row, 2,
+        f"=IF({x_ref}>0,\"\u041f\u043e \u0447\u0435\u043a-\u043b\u0438\u0441\u0442\u0443: \u041d\u0415 \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442 \u043f\u0440\u0435\u0441\u043a\u043e\u0440\u0438\u043d\u0433 (\u0435\u0441\u0442\u044c \u0441\u0442\u043e\u043f-\u0444\u0430\u043a\u0442\u043e\u0440\u044b)\",IF({y_ref}>2,\"\u041f\u043e \u0447\u0435\u043a-\u043b\u0438\u0441\u0442\u0443: \u041d\u0415 \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442 \u043f\u0440\u0435\u0441\u043a\u043e\u0440\u0438\u043d\u0433 (\u0431\u043e\u043b\u0435\u0435 2 \u043a\u0440\u0430\u0441\u043d\u044b\u0445 \u0444\u043b\u0430\u0433\u043e\u0432)\",IF({z_ref}>3,\"\u041f\u043e \u0447\u0435\u043a-\u043b\u0438\u0441\u0442\u0443: \u041d\u0415 \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442 \u043f\u0440\u0435\u0441\u043a\u043e\u0440\u0438\u043d\u0433 (\u0431\u043e\u043b\u0435\u0435 3 \u0436\u0451\u043b\u0442\u044b\u0445 \u0444\u043b\u0430\u0433\u043e\u0432)\",\"\u041f\u043e \u0447\u0435\u043a-\u043b\u0438\u0441\u0442\u0443: \u041f\u0420\u041e\u0425\u041e\u0414\u0418\u0422 \u043f\u0440\u0435\u0441\u043a\u043e\u0440\u0438\u043d\u0433\")))",
+        font=F_HDR, align=A_LEFT)
+    row += 1
+
+    return row
+
+
 
 
 def generate_insights(file_bytes: bytes) -> bytes:
-    """Точка входа: принимает bytes книги, возвращает bytes с листом `инсайты`."""
-    wb = _load_wb_from_bytes(file_bytes)
+    """Создаёт лист "инсайты". Если уже есть — не пересоздаёт."""
+    wb = _load_wb(file_bytes)
 
-    pref = _select_insights_prefix(wb.sheetnames)
+    required = {"W", "M", "Wt", "Mt"}
+    if not required.issubset(set(wb.sheetnames)):
+        return file_bytes
 
-    # Обязательные листы
-    sh_w = _pick_first_sheet_by_suffix(wb.sheetnames, pref, "W")
-    sh_m = _pick_first_sheet_by_suffix(wb.sheetnames, pref, "M")
-    sh_wt = _pick_first_sheet_by_suffix(wb.sheetnames, pref, "Wt")
-    sh_mt = _pick_first_sheet_by_suffix(wb.sheetnames, pref, "Mt")
+    if "инсайты" in wb.sheetnames:
+        return _save_wb(wb)
 
-    ws_w = wb[sh_w]
-    ws_m = wb[sh_m]
-    ws_wt = wb[sh_wt]
-    ws_mt = wb[sh_mt]
+    ws = wb.create_sheet("инсайты", 0)
 
-    # Опциональный лист
-    ws_cred = None
-    try:
-        sh_cred = _pick_first_sheet_by_suffix(wb.sheetnames, pref, "кред")
-        ws_cred = wb[sh_cred]
-    except Exception:
-        ws_cred = None
+    # widths
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 50
+    for col in range(3, 15):
+        ws.column_dimensions[get_column_letter(col)].width = 16
 
-    styles = Styles()
+    # title
+    _write_row(ws, 1, ["ИНСАЙТЫ"], font=F_TITLE, align=A_LEFT)
 
-    ws = _delete_and_create_sheet_first(wb, "инсайты")
-    _set_insights_column_widths(ws)
+    row = 3
+    ws_wt = wb["Wt"]
+    ws_mt = wb["Mt"]
+    ws_m = wb["M"]
+    ws_w = wb["W"]
+    ws_cred = wb["кред"] if "кред" in wb.sheetnames else None
 
-    NUM = "#,##0"
-    PCT = "0.0%"
+    row = _write_block1(ws, row, ws_wt=ws_wt, ws_cred=ws_cred)
+    row = _write_block2(ws, row, ws_m=ws_m)
+    row = _write_block3(ws, row, ws_w=ws_w)
+    row = _write_block4(ws, row, ws_mt=ws_mt, ws_wt=ws_wt)
+    row = _write_block5(ws, row, ws_wt=ws_wt)
 
-    row = 1
-    _write_row(ws, row, ["ИНСАЙТЫ"], font=styles.f_title, align=styles.a_left)
-    row += 2
-
-    # ---- читаем входные данные ----
-    w_rows = parse_w_sheet(ws_w)
-    m_rows = parse_m_sheet(ws_m)
-
-    wt_exclude = {"Прочая ДЗ/КЗ Inflow", "Прочая ДЗ/КЗ Outflow"}
-    wt_tables = parse_wt_like_tables(ws_wt, start_row=3, excluded_names=wt_exclude)
-
-    cred_tables: List[ParsedTable] = []
-    if ws_cred is not None:
-        cred_tables = parse_wt_like_tables(
-            ws_cred,
-            start_row=5,
-            allowed_names={"Краткосрочные кредиты (Netto)", "Долгосрочные кредиты (Netto)"},
-            skip_row_names={"", "Тело", "Проценты", "Платежи"},
-        )
-
-    mt = parse_mt(ws_mt)
-
-    # =========================
-    # БЛОК 1: Пересечения контрагентов
-    # =========================
-
-    _write_row(ws, row, ["1. ПЕРЕСЕЧЕНИЯ КОНТРАГЕНТОВ (Wt / кред)"], font=styles.f_hdr, align=styles.a_left)
-    row += 1
-    _write_row(ws, row, ["Контрагенты, присутствующие в 2+ таблицах"], font=styles.f_italic_gray_small, align=styles.a_left)
-    row += 1
-    _write_row(ws, row, ["Контрагент", "Лист", "Таблица", "Направление", "Итого"], font=styles.f_hdr, fill=styles.fill_hdr, align=styles.a_left)
-    row += 1
-
-    entries: List[Tuple[str, str, str, float]] = []
-    for t in wt_tables:
-        for e in t.entries:
-            entries.append((e.name, "Wt", t.name, e.total))
-
-    for t in cred_tables:
-        for e in t.entries:
-            entries.append((e.name, "кред", t.name, e.total))
-
-    # карта: контрагент -> список уникальных (лист+таблица)
-    mp: Dict[str, List[Tuple[str, str, float]]] = {}
-    for name, sh, tbl, tot in entries:
-        mp.setdefault(name, [])
-        if (sh, tbl) not in {(a, b) for (a, b, _v) in mp[name]}:
-            mp[name].append((sh, tbl, tot))
-
-    intersect = {k: v for k, v in mp.items() if len(v) >= 2}
-
-    company_tables = {"Клиенты", "Пост-ки", "Прочая ДЗ/КЗ", "Прочие займы", "Краткосрочные кредиты (Netto)", "Долгосрочные кредиты (Netto)"}
-
-    def is_company(items: List[Tuple[str, str, float]]) -> bool:
-        for sh, tbl, _tot in items:
-            if tbl in company_tables:
-                return True
-        return False
-
-    companies = sorted([k for k, v in intersect.items() if is_company(v)])
-    persons = sorted([k for k, v in intersect.items() if not is_company(v)])
-
-    used_kred_and_wt: set = set()
-
-    def write_intersect_group(names: List[str]) -> None:
-        nonlocal row
-        for nm in names:
-            items = intersect[nm]
-            for i, (sh, tbl, tot) in enumerate(items):
-                if sh == "кред":
-                    used_kred_and_wt.add(nm)
-                direction = "Приход" if tot >= 0 else "Расход"
-                _write_row(ws, row, [nm if i == 0 else "", sh, tbl, direction, int(round(tot))], font=styles.f_def, align=styles.a_left)
-                c_val = ws.cell(row=row, column=6)
-                c_val.number_format = NUM
-                c_val.font = Font(name="Calibri", size=11, color=(styles.green if tot >= 0 else styles.red))
-                row += 1
-
-    if intersect:
-        write_intersect_group(companies)
-        if persons:
-            _write_row(ws, row, ["Физические лица (подотчет + персонал):"], font=Font(name="Calibri", size=9, italic=True, color=styles.gray), align=styles.a_left)
-            row += 1
-            write_intersect_group(persons)
+    ws_obsh = wb["общ"] if "общ" in wb.sheetnames else None
+    if ws_obsh is None:
+        _write_row(ws, row, ["Блок 6 недоступен: лист «общ» не найден"] , font=F_HDR, align=A_LEFT)
+        row += 2
     else:
-        _write_row(ws, row, ["Пересечений не выявлено"], font=Font(name="Calibri", size=11, color=styles.green), align=styles.a_left)
-        row += 1
+        row = _write_block6(ws, row, ws_obsh=ws_obsh, ws_m=ws_m, ws_w=ws_w)
 
-    row += 2
-
-    # =========================
-    # БЛОК 2: Регулярность выручки (M)
-    # =========================
-
-    _write_row(ws, row, ["2. РЕГУЛЯРНОСТЬ ВЫРУЧКИ (M)"], font=styles.f_hdr, align=styles.a_left)
-    row += 1
-
-    # Среднее по месяцам с данными (не нулевым)
-    rev_vals = [r.rev for r in m_rows if abs(r.rev) > 0]
-    avg_rev = (sum(rev_vals) / len(rev_vals)) if rev_vals else 0.0
-    thr = 0.1 * avg_rev
-
-    # Перерывы: последовательности месяцев, где выручка < порога
-    breaks: List[Tuple[str, str, int]] = []
-    cur_start = None
-    cur_n = 0
-    prev_ym = None
-
-    for r0 in m_rows:
-        low = (r0.rev < thr) if avg_rev > 0 else False
-        if low:
-            if cur_start is None:
-                cur_start = r0.ym
-                cur_n = 1
-            else:
-                cur_n += 1
-            prev_ym = r0.ym
-        else:
-            if cur_start is not None:
-                breaks.append((cur_start, prev_ym or cur_start, cur_n))
-                cur_start = None
-                cur_n = 0
-                prev_ym = None
-
-    if cur_start is not None:
-        breaks.append((cur_start, prev_ym or cur_start, cur_n))
-
-    if breaks:
-        for s, e, n in breaks:
-            _write_row(ws, row, [f"Перерыв: {s} — {e} ({n} мес. выручка < порога)"], font=Font(name="Calibri", size=11, color=styles.red), align=styles.a_left)
-            row += 1
-    else:
-        _write_row(ws, row, ["Перерывов не выявлено"], font=Font(name="Calibri", size=11, color=styles.green), align=styles.a_left)
-        row += 1
-
-    # Аномалии: падение относительно скользящей средней
-    problems: List[Tuple[str, float, float, str]] = []
-    for i in range(1, len(m_rows)):
-        prev = m_rows[max(0, i - 3): i]
-        avg3 = (sum(p.rev for p in prev) / len(prev)) if prev else 0.0
-        cur = m_rows[i].rev
-        if avg3 > 0:
-            if cur == 0:
-                problems.append((m_rows[i].ym, cur, avg3, "Нулевая выручка"))
-            elif cur < 0.3 * avg3:
-                пад = int(round((1 - (cur / avg3)) * 100))
-                problems.append((m_rows[i].ym, cur, avg3, f"Падение {пад}%"))
-
-    if problems:
-        _write_row(ws, row, ["Период", "Выручка", "Ср. 3 мес.", "Статус"], font=styles.f_hdr, fill=styles.fill_hdr, align=styles.a_left)
-        row += 1
-        for ym, rev, a3, st in problems:
-            _write_row(ws, row, [ym, int(round(rev)), int(round(a3)), st], font=styles.f_def, align=styles.a_left)
-            ws.cell(row=row, column=3).number_format = NUM
-            ws.cell(row=row, column=4).number_format = NUM
-            ws.cell(row=row, column=5).font = Font(name="Calibri", size=11, bold=True, color=styles.red)
-            row += 1
-    else:
-        _write_row(ws, row, ["Проблемных месяцев не выявлено"], font=Font(name="Calibri", size=11, color=styles.green), align=styles.a_left)
-        row += 1
-
-    row += 2
-
-    # =========================
-    # БЛОК 3: Регулярность персонала и налогов (W)
-    # =========================
-
-    _write_row(ws, row, ["3. РЕГУЛЯРНОСТЬ ПЕРСОНАЛА И НАЛОГОВ (W)"], font=styles.f_hdr, align=styles.a_left)
-    row += 1
-    _write_row(ws, row, ["Аномалии: падение >50% от скользящего среднего за 3 мес."], font=styles.f_italic_gray_small, align=styles.a_left)
-    row += 1
-
-    def rolling_anoms(values: List[Tuple[str, float]]) -> List[Tuple[str, float, float, str]]:
-        out2: List[Tuple[str, float, float, str]] = []
-        for i in range(1, len(values)):
-            prev = values[max(0, i - 3): i]
-            avg3 = sum(v for _ym0, v in prev) / len(prev) if prev else 0.0
-            cur = values[i][1]
-            if avg3 > 1000:
-                if cur == 0:
-                    out2.append((values[i][0], cur, avg3, "Нулевой платеж"))
-                elif cur < 0.5 * avg3:
-                    пад = int(round((1 - (cur / avg3)) * 100))
-                    out2.append((values[i][0], cur, avg3, f"Падение {пад}%"))
-        return out2
-
-    pers_series = [(r.ym, r.pers) for r in w_rows]
-    tax_series = [(r.ym, r.taxes) for r in w_rows]
-
-    pers_an = rolling_anoms(pers_series)
-    tax_an = rolling_anoms(tax_series)
-
-    def write_subblock(title: str, items: List[Tuple[str, float, float, str]]) -> None:
-        nonlocal row
-        _write_row(ws, row, [title], font=styles.f_hdr, align=styles.a_left)
-        row += 1
-        if not items:
-            _write_row(ws, row, ["Аномалий не выявлено"], font=Font(name="Calibri", size=11, color=styles.green), align=styles.a_left)
-            row += 1
-            return
-        _write_row(ws, row, ["Период", "Сумма", "Ср. 3 мес.", "Статус"], font=styles.f_hdr, fill=styles.fill_prob, align=styles.a_left)
-        row += 1
-        for ym, val, a3, st in items:
-            _write_row(ws, row, [ym, int(round(val)), int(round(a3)), st], font=styles.f_def, align=styles.a_left)
-            ws.cell(row=row, column=3).number_format = NUM
-            ws.cell(row=row, column=4).number_format = NUM
-            ws.cell(row=row, column=5).font = Font(name="Calibri", size=11, bold=True, color=styles.red)
-            row += 1
-
-    write_subblock("Персонал", pers_an)
-    write_subblock("Налоги", tax_an)
-
-    row += 2
-
-    # =========================
-    # БЛОК 4: Концентрация клиентов (Mt + Wt Клиенты)
-    # =========================
-
-    _write_row(ws, row, ["4. КОНЦЕНТРАЦИЯ КЛИЕНТОВ"], font=styles.f_hdr, align=styles.a_left)
-    row += 1
-
-    def write_concentration(title: str, cps: List[TableEntry], total_all: float) -> Tuple[Optional[str], float, int]:
-        nonlocal row
-        _write_row(ws, row, [title], font=styles.f_hdr, align=styles.a_left)
-        row += 1
-        if not cps or total_all == 0:
-            _write_row(ws, row, ["Данных нет"], font=Font(name="Calibri", size=11, color=styles.gray), align=styles.a_left)
-            row += 1
-            return None, 0.0, 0
-
-        _write_row(ws, row, ["Клиент", "Сумма", "Доля"], font=styles.f_hdr, fill=styles.fill_hdr, align=styles.a_left)
-        row += 1
-
-        cps_sorted = sorted(cps, key=lambda x: abs(x.total), reverse=True)
-        top1_name = cps_sorted[0].name
-        top1_share = (cps_sorted[0].total / total_all) if total_all else 0.0
-
-        for e in cps_sorted:
-            share = (e.total / total_all) if total_all else 0.0
-            _write_row(ws, row, [e.name, int(round(e.total)), share], font=styles.f_def, align=styles.a_left)
-            ws.cell(row=row, column=4).number_format = NUM
-            ws.cell(row=row, column=5).number_format = PCT
-            if share > 0.70:
-                ws.cell(row=row, column=5).font = Font(name="Calibri", size=11, bold=True, color=styles.red)
-            row += 1
-
-        if top1_share > 0.70:
-            _write_row(
-                ws,
-                row,
-                [f"ВЫСОКАЯ КОНЦЕНТРАЦИЯ: {top1_share*100:.1f}% — один клиент ({top1_name})"],
-                font=Font(name="Calibri", size=11, bold=True, color=styles.red),
-                align=styles.a_left,
-            )
-            row += 1
-        elif top1_share > 0.50:
-            _write_row(
-                ws,
-                row,
-                [f"ЗНАЧИТЕЛЬНАЯ КОНЦЕНТРАЦИЯ: {top1_share*100:.1f}% — один клиент ({top1_name})"],
-                font=Font(name="Calibri", size=11, bold=True, color=styles.orange),
-                align=styles.a_left,
-            )
-            row += 1
-
-        _write_row(ws, row, [f"Всего клиентов: {len(cps_sorted)}"], font=styles.f_def, align=styles.a_left)
-        row += 1
-
-        return top1_name, top1_share, len(cps_sorted)
-
-    mt_top1_name, mt_top1_share, mt_n = write_concentration("Выручка (Mt)", mt.entries, mt.total_all)
-    row += 1
-
-    wt_clients_tbl = next((t for t in wt_tables if t.name == "Клиенты"), None)
-    wt_total_all = 0.0
-    wt_entries: List[TableEntry] = []
-    if wt_clients_tbl is not None:
-        wt_entries = wt_clients_tbl.entries
-        if wt_clients_tbl.total_row:
-            wt_total_all = _to_float(ws_wt.cell(row=wt_clients_tbl.total_row, column=wt_clients_tbl.grand_total_col).value)
-
-    wt_top1_name, wt_top1_share, wt_n = write_concentration("Поступления от клиентов (Wt)", wt_entries, wt_total_all)
-
-    row += 2
-
-    # =========================
-    # БЛОК 5: Сезонность поступлений от клиентов (Wt Клиенты / строка Всего)
-    # =========================
-
-    _write_row(ws, row, ["5. СЕЗОННОСТЬ ПОСТУПЛЕНИЙ ОТ КЛИЕНТОВ (Wt)"], font=styles.f_hdr, align=styles.a_left)
-    row += 1
-
-    months_ru = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
-
-    season_lows: List[int] = []
-    season_spread = 0.0
-
-    if wt_clients_tbl is None or not wt_clients_tbl.total_row or not wt_clients_tbl.month_cols:
-        _write_row(ws, row, ["Данных нет"], font=Font(name="Calibri", size=11, color=styles.gray), align=styles.a_left)
-        row += 1
-    else:
-        # Берём первые 24 месяца из month_cols: 2025 (12) + 2026 (12)
-        mcols = wt_clients_tbl.month_cols[:24]
-        vals_25 = [0.0] * 12
-        vals_26 = [0.0] * 12
-
-        for i, c in enumerate(mcols):
-            v = _to_float(ws_wt.cell(row=wt_clients_tbl.total_row, column=c).value)
-            if i < 12:
-                vals_25[i] = v
-            elif i < 24:
-                vals_26[i - 12] = v
-
-        # Последний месяц 2026 с данными
-        last_26 = 12
-        for i in range(11, -1, -1):
-            if abs(vals_26[i]) > 0:
-                last_26 = i + 1
-                break
-
-        avg25 = sum(vals_25) / 12.0 if vals_25 else 0.0
-        peaks = [i + 1 for i, v in enumerate(vals_25) if avg25 > 0 and v > 1.5 * avg25]
-        season_lows = [i + 1 for i, v in enumerate(vals_25) if avg25 > 0 and v < 0.3 * avg25]
-
-        nonzero = [v for v in vals_25 if abs(v) > 0]
-        mn = min(nonzero) if nonzero else 0.0
-        mx = max(nonzero) if nonzero else 0.0
-        season_spread = (mx / mn) if mn not in (0, 0.0) else 0.0
-
-        _write_row(
-            ws,
-            row,
-            [
-                f"Среднее за 2025: {int(round(avg25))} / мес. "
-                f"Пиковые: {', '.join(map(str, peaks)) or '-'}; "
-                f"Провалы: {', '.join(map(str, season_lows)) or '-'}",
-            ],
-            font=styles.f_italic_gray_small,
-            align=styles.a_left,
-        )
-        row += 1
-
-        _write_row(ws, row, ["", *months_ru], font=styles.f_hdr, fill=styles.fill_hdr, align=styles.a_center)
-        row += 1
-
-        _write_row(ws, row, ["2025", *[int(round(v)) for v in vals_25]], font=styles.f_def, align=styles.a_center)
-        for i in range(12):
-            c = ws.cell(row=row, column=3 + i)
-            c.number_format = NUM
-            if (i + 1) in peaks:
-                c.fill = styles.fill_peak
-                c.font = Font(name="Calibri", size=11, color=styles.green)
-            if (i + 1) in season_lows:
-                c.fill = styles.fill_low
-                c.font = Font(name="Calibri", size=11, color=styles.red)
-        row += 1
-
-        _write_row(ws, row, ["2026", *[int(round(v)) for v in vals_26]], font=styles.f_def, align=styles.a_center)
-        for i in range(12):
-            c = ws.cell(row=row, column=3 + i)
-            c.number_format = NUM
-            if i + 1 > last_26:
-                c.font = Font(name="Calibri", size=11, color="CCCCCC")
-        row += 1
-
-        _write_row(
-            ws,
-            row,
-            ["Ср. мес.", *[int(round(avg25)) for _ in range(12)]],
-            font=Font(name="Calibri", size=11, bold=True, italic=True, color=styles.gray),
-            align=styles.a_center,
-        )
-        for i in range(12):
-            ws.cell(row=row, column=3 + i).number_format = NUM
-        row += 1
-
-        if season_spread and season_spread > 0:
-            _write_row(
-                ws,
-                row,
-                [f"Поступления крайне неравномерны: мин. {int(round(mn))}, макс. {int(round(mx))} — разброс в {season_spread:.1f}x"],
-                font=Font(name="Calibri", size=11, color=styles.orange),
-                align=styles.a_left,
-            )
-            row += 1
-        if season_lows:
-            _write_row(
-                ws,
-                row,
-                ["Риск кассового разрыва в периоды низких поступлений при сохранении фиксированных расходов"],
-                font=Font(name="Calibri", size=11, bold=True, color=styles.red),
-                align=styles.a_left,
-            )
-            row += 1
-
-    row += 2
-
-    # =========================
-    # ИТОГО: ключевые риски
-    # =========================
-
-    _write_row(ws, row, ["ИТОГО: КЛЮЧЕВЫЕ РИСКИ"], font=Font(name="Calibri", size=12, bold=True), fill=styles.fill_risk, align=styles.a_left)
-    row += 1
-
-    risks: List[str] = []
-
-    # 1) Концентрация: топ-1 по Mt > 70%
-    if mt_top1_share > 0.70 and mt_top1_name:
-        x = mt_top1_share * 100
-        y = wt_top1_share * 100
-        risks.append(f"Критическая зависимость от одного клиента ({mt_top1_name}): {x:.1f}% выручки, {y:.1f}% поступлений")
-
-    # 2) Перерывы выручки >= 2 мес.
-    for s, e, n in breaks:
-        if n >= 2:
-            risks.append(f"Нерегулярная выручка: провал {s}—{e} ({n} мес. < порога)")
-            break
-
-    # 3) Сезонность: есть провальные месяцы
-    if season_lows:
-        risks.append(f"Сезонность поступлений: провальные месяцы, риск кассового разрыва")
-
-    # 4) Аномалии в персонале/налогах
-    if pers_an or tax_an:
-        risks.append("Нестабильные платежи по налогам и персоналу: пропуски и резкие снижения")
-
-    # 5) Пересечения с кредитами
-    if used_kred_and_wt:
-        names = ", ".join(sorted(list(used_kred_and_wt))[:5])
-        risks.append(f"Пересечения с кредитами (кред + Wt): {names}")
-
-    if not risks:
-        _write_row(ws, row, ["Риски не выявлены"], font=Font(name="Calibri", size=11, color=styles.green), align=styles.a_left)
-        row += 1
-    else:
-        for i, t in enumerate(risks, start=1):
-            _write_row(ws, row, [f"{i}. {t}"], font=Font(name="Calibri", size=11, color=styles.red), align=styles.a_left)
-            row += 1
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
-
-
-__all__ = ["generate_insights"]
+    return _save_wb(wb)
