@@ -920,10 +920,18 @@ def add_cleaned_osv_files_to_analysis(analysis_wb, osv_files: Iterable[Tuple[str
 
 
 def compute_availability_from_wb(wb) -> Dict[str, object]:
-    inventory_accounts = ["1310", "1320", "1330"]
     saldo_suffixes = {"1210", "1710", "3310", "3510"}
 
-    inv_map = {acc: any(acc in sh for sh in wb.sheetnames) for acc in inventory_accounts}
+    # Запасы: считаем доступными, если есть хотя бы один ОСВ-лист с 4-значным счётом, начинающимся на "13"
+    inventory_accounts_found: List[str] = []
+    inv_set: Set[str] = set()
+    for sh in wb.sheetnames:
+        _p, suf4 = split_prefix_suffix4(sh)
+        if suf4.isdigit() and len(suf4) == 4 and suf4.startswith("13"):
+            inv_set.add(suf4)
+    if inv_set:
+        inventory_accounts_found = sorted(inv_set)
+
     saldo_ok = any(split_prefix_suffix4(sh)[1] in saldo_suffixes for sh in wb.sheetnames)
 
     # ОСВ "общ" (казахстанская ОСВ) — для неё нужен справочник "Счета каз"
@@ -950,21 +958,31 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
     insights_prefixes = [p for p, s in prefix_to_ins.items() if required_ins.issubset(s)]
 
     # Листы инсайтов уже могут быть в файле и их нельзя перезатирать.
-    # Поэтому считаем доступность как: есть ли хотя бы один префикс-набор, где инсайты ещё НЕ созданы.
+    # Также поддерживаем миграцию старого имени листа: "инсайты" -> "инс".
+    # Поэтому считаем доступность как:
+    # - есть ли хотя бы один префикс-набор, где "инс" ещё НЕ создан
+    # - или есть ли хотя бы один старый лист "инсайты", который нужно переименовать.
     insights_existing_titles: List[str] = []
     insights_missing_titles: List[str] = []
+    insights_legacy_titles: List[str] = []
     for pfx in insights_prefixes:
-        base = 'инсайты' if not pfx else f'инсайты {pfx}'
-        title = base[:31]
-        if title in wb.sheetnames:
-            insights_existing_titles.append(title)
-        else:
-            insights_missing_titles.append(title)
+        base_new = 'инс' if not pfx else f'{pfx}инс'
+        title_new = base_new[:31]
+        base_old = 'инсайты' if not pfx else f'инсайты {pfx}'
+        title_old = base_old[:31]
 
-    insights_ok = bool(insights_missing_titles)
+        if title_new in wb.sheetnames:
+            insights_existing_titles.append(title_new)
+        elif title_old in wb.sheetnames:
+            insights_existing_titles.append(title_old)
+            insights_legacy_titles.append(title_old)
+        else:
+            insights_missing_titles.append(title_new)
+
+    insights_ok = bool(insights_missing_titles) or bool(insights_legacy_titles)
 
     return {
-        "inventory_map": inv_map,
+        "inventory_accounts_found": inventory_accounts_found,
         "saldo_ok": saldo_ok,
         "contracts_ok": contracts_ok,
         "contracts_prefixes": contracts_prefixes,
@@ -973,6 +991,7 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
         "insights_prefixes": insights_prefixes,
         "insights_existing_titles": insights_existing_titles,
         "insights_missing_titles": insights_missing_titles,
+        "insights_legacy_titles": insights_legacy_titles,
     }
 
 
@@ -994,6 +1013,20 @@ def list_existing_saldo_sheets_with_a1(wb) -> List[Tuple[str, str, str]]:
     for sh in wb.sheetnames:
         prefix, suf = split_prefix_suffix4(sh)
         if suf in accounts:
+            try:
+                a1 = extract_company_label_from_a1(wb[sh])
+            except Exception:
+                a1 = ""
+            out.append((sh, suf, _short(a1)))
+    return out
+
+
+def list_existing_osv_sheets_with_a1(wb) -> List[Tuple[str, str, str]]:
+    """Возвращает кортежи (имя_листа, 4-значный суффикс, A1_текст) для всех ОСВ-листов."""
+    out = []
+    for sh in wb.sheetnames:
+        _prefix, suf = split_prefix_suffix4(sh)
+        if suf.isdigit() and len(suf) == 4:
             try:
                 a1 = extract_company_label_from_a1(wb[sh])
             except Exception:
@@ -1185,6 +1218,30 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 best_key = key
         return best
 
+    def _find_prefixed_sheetname_any(prefix_norm: str, base: str) -> Optional[str]:
+        """
+        Ищет лист вида "<префикс><base>" (регистр не важен),
+        также допускается суффикс " (n)". Возвращает лучший кандидат или None.
+        """
+        base_l = (base or "").lower()
+        best = None
+        best_key = None
+        for name in wb.sheetnames:
+            nm = str(name)
+            nm2 = re.sub(r"\s*\(\d+\)$", "", nm).strip()
+            if not nm2.lower().endswith(base_l):
+                continue
+            pref_part = nm2[: -len(base_l)]
+            if normalize_prefix(pref_part) != prefix_norm:
+                continue
+            m = re.search(r"\((\d+)\)\s*$", nm)
+            n = int(m.group(1)) if m else 0
+            key = (1 if m else 0, n, len(nm))  # предпочитаем точное имя без " (n)"
+            if best is None or key < best_key:
+                best = nm
+                best_key = key
+        return best
+
     def _top15_pos_neg(df: pd.DataFrame, col: str) -> pd.DataFrame:
         if df is None or df.empty or col not in df.columns:
             return df.iloc[0:0].copy()
@@ -1259,137 +1316,29 @@ def run_code_1(file_bytes: bytes) -> bytes:
         else:
             df_total = pd.DataFrame(columns=["Контрагент", "общее сальдо"])
 
-        # Переименование по требованию:
-        # - "сальд" (базовый лист) теперь называется "сальд (2)"
-        # - "сальд (2)" (расширенный лист) теперь называется "сальд"
-        out_sheet_name = safe_sheet_name(f"{prefix}сальд (2)" if prefix else "сальд (2)")
-        if out_sheet_name in wb.sheetnames:
-            wb.remove(wb[out_sheet_name])
-        ws = wb.create_sheet(out_sheet_name)
-
-        ws["A1"] = "Все значения указаны в тысячах тенге"
-        ws["A1"].font = Font(name="Arial", size=10, bold=True)
-
-        start_row = 2
-        start_col = 2  # B
-
-        font_header = Font(name="Arial", size=10, bold=True)
-        font_body = Font(name="Arial", size=10)
-        font_bold_body = Font(name="Arial", size=10, bold=True)
-        align_center = Alignment(horizontal="center")
-        align_left = Alignment(horizontal="left")
-        number_format_acc = "#,##0;[Red](#,##0)"
-
-        col_cust_contr = start_col
-        col_cust_1210 = start_col + 1
-        col_cust_3510 = start_col + 2
-        col_cust_saldo = start_col + 3
-
-        col_supp_contr = start_col + 5
-        col_supp_1710 = start_col + 6
-        col_supp_3310 = start_col + 7
-        col_supp_saldo = start_col + 8
-
-        col_total_contr = start_col + 10
-        col_total_saldo = start_col + 11
-
-        if not df_cust.empty:
-            headers = {
-                col_cust_contr: "Контрагент",
-                col_cust_1210: "1210",
-                col_cust_3510: "3510",
-                col_cust_saldo: "сальдо с заказчиками",
-            }
-            for col, text in headers.items():
-                c = ws.cell(row=start_row, column=col, value=text)
-                c.font = font_header
-                c.alignment = align_center
-
-            for i, (_, row) in enumerate(df_cust.iterrows(), start=start_row + 1):
-                r = i
-                c_contr = ws.cell(row=r, column=col_cust_contr, value=row["Контрагент"])
-                c_contr.font = font_body
-                c_contr.alignment = align_left
-
-                for col, val, style in [
-                    (col_cust_1210, row["1210"], font_body),
-                    (col_cust_3510, row["3510"], font_body),
-                    (col_cust_saldo, row["сальдо заказчики"], font_bold_body),
-                ]:
-                    cell = ws.cell(row=r, column=col, value=val)
-                    cell.font = style
-                    cell.alignment = align_center
-                    cell.number_format = number_format_acc
-
-        if not df_supp.empty:
-            headers = {
-                col_supp_contr: "Контрагент",
-                col_supp_1710: "1710",
-                col_supp_3310: "3310",
-                col_supp_saldo: "сальдо с поставщиками",
-            }
-            for col, text in headers.items():
-                c = ws.cell(row=start_row, column=col, value=text)
-                c.font = font_header
-                c.alignment = align_center
-
-            for i, (_, row) in enumerate(df_supp.iterrows(), start=start_row + 1):
-                r = i
-                c_contr = ws.cell(row=r, column=col_supp_contr, value=row["Контрагент"])
-                c_contr.font = font_body
-                c_contr.alignment = align_left
-
-                for col, val, style in [
-                    (col_supp_1710, row["1710"], font_body),
-                    (col_supp_3310, row["3310"], font_body),
-                    (col_supp_saldo, row["сальдо поставщики"], font_bold_body),
-                ]:
-                    cell = ws.cell(row=r, column=col, value=val)
-                    cell.font = style
-                    cell.alignment = align_center
-                    cell.number_format = number_format_acc
-
-        if not df_total.empty:
-            headers = {col_total_contr: "Контрагент", col_total_saldo: "общее сальдо"}
-            for col, text in headers.items():
-                c = ws.cell(row=start_row, column=col, value=text)
-                c.font = font_header
-                c.alignment = align_center
-
-            for i, (_, row) in enumerate(df_total.iterrows(), start=start_row + 1):
-                r = i
-                c_contr = ws.cell(row=r, column=col_total_contr, value=row["Контрагент"])
-                c_contr.font = font_body
-                c_contr.alignment = align_left
-
-                cell = ws.cell(row=r, column=col_total_saldo, value=row["общее сальдо"])
-                cell.font = font_bold_body
-                cell.alignment = align_center
-                cell.number_format = number_format_acc
-
-        WIDTH_CONTR = 30
-        WIDTH_NUM = 18
-        for col in [col_cust_contr, col_supp_contr, col_total_contr]:
-            ws.column_dimensions[get_column_letter(col)].width = WIDTH_CONTR
-        for col in [
-            col_cust_1210, col_cust_3510, col_cust_saldo,
-            col_supp_1710, col_supp_3310, col_supp_saldo,
-            col_total_saldo
-        ]:
-            ws.column_dimensions[get_column_letter(col)].width = WIDTH_NUM
-
         # =========================
-        # Лист "сальд (2)" — топ-15 (плюс/минус) + блоки оплат/выполнений с формулами по месяцам
+        # Лист "сальд" — топ-15 (плюс/минус) + блоки оплат/выполнений с формулами по месяцам
         # =========================
         out2_name = safe_sheet_name(f"{prefix}сальд" if prefix else "сальд")
         if out2_name in wb.sheetnames:
             wb.remove(wb[out2_name])
-        ws2 = wb.create_sheet(out2_name)
+
+        # Порядок вкладок: "сальд" должен идти сразу после листа "общ" соответствующего префикса.
+        # Если "общ" не найден — добавляем в конец.
+        pref_norm = normalize_prefix(prefix)
+        obsh_name = _find_prefixed_sheetname_any(pref_norm, "общ") or (f"{prefix}общ" if prefix else "общ")
+        insert_index = None
+        if obsh_name in wb.sheetnames:
+            try:
+                insert_index = wb.sheetnames.index(obsh_name) + 1
+            except Exception:
+                insert_index = None
+        ws2 = wb.create_sheet(out2_name, insert_index) if insert_index is not None else wb.create_sheet(out2_name)
 
         ws2["A1"] = "Все значения указаны в тысячах тенге"
         ws2["A1"].font = Font(name="Calibri", size=10, bold=True)
 
-        # На "сальд (2)" везде используем Calibri.
+        # На "сальд" везде используем Calibri.
         font_h = Font(name="Calibri", size=10, bold=True)
         font_b = Font(name="Calibri", size=10)
         font_bb = Font(name="Calibri", size=10, bold=True)
@@ -1433,7 +1382,6 @@ def run_code_1(file_bytes: bytes) -> bytes:
         # Блоки "Поставщики" и "Общее сальдо" размещаем ниже динамически (так как добавляем строки сумм/итого).
 
         # Подбираем Wr/Mr для текущего префикса (если такие листы есть) — имена нужны внутри формул.
-        pref_norm = normalize_prefix(prefix)
         wr_name = _find_prefixed_sheetname(pref_norm, "Wr") or (f"{prefix}Wr" if prefix else "Wr")
         mr_name = _find_prefixed_sheetname(pref_norm, "Mr") or (f"{prefix}Mr" if prefix else "Mr")
         wr_ref = _excel_sheet_ref(wr_name)
@@ -1974,10 +1922,56 @@ def run_code_2(file_bytes: bytes) -> bytes:
         source_sheets_to_delete.add(md_name)
         source_sheets_to_delete.add(wd_name)
 
+        def _as_int_year(v) -> Optional[int]:
+            if v is None:
+                return None
+            if isinstance(v, (int, float)) and float(v).is_integer():
+                y = int(v)
+                return y if 1900 <= y <= 2500 else None
+            s = str(v).strip()
+            m = re.search(r"(\d{4})", s)
+            if not m:
+                return None
+            try:
+                y = int(m.group(1))
+                return y if 1900 <= y <= 2500 else None
+            except Exception:
+                return None
+
+        def _scan_month_headers(sheet) -> List[Tuple[int, str]]:
+            """Ищет заголовки вида YYYY_MM в 1-й строке и возвращает [(col_idx, label), ...] по порядку колонок."""
+            out: List[Tuple[int, str]] = []
+            max_col = int(sheet.max_column or 1)
+            for c in range(1, max_col + 1):
+                v = sheet.cell(row=1, column=c).value
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if re.fullmatch(r"\d{4}_\d{2}", s):
+                    out.append((c, s))
+            return out
+
+        years_pay = [_as_int_year(wd_ws["C1"].value), _as_int_year(wd_ws["D1"].value), _as_int_year(wd_ws["E1"].value)]
+        years_perf = [_as_int_year(md_ws["C1"].value), _as_int_year(md_ws["D1"].value), _as_int_year(md_ws["E1"].value)]
+        years_pay = [y for y in years_pay if y is not None]
+        years_perf = [y for y in years_perf if y is not None]
+
+        # По текущей структуре "Договоры" ожидаем 3 годовых колонки (C/D/E). Если что-то не так — не ломаемся,
+        # просто подставляем "пустые" годы для сохранения структуры.
+        while len(years_pay) < 3:
+            years_pay.append(0)
+        while len(years_perf) < 3:
+            years_perf.append(0)
+        years_pay = years_pay[:3]
+        years_perf = years_perf[:3]
+
         payments_year = defaultdict(lambda: [0.0, 0.0, 0.0])
         performance_year = defaultdict(lambda: [0.0, 0.0, 0.0])
-        payments_2025_monthly = defaultdict(lambda: [0.0] * 12)
-        performance_2025_monthly = defaultdict(lambda: [0.0] * 12)
+
+        pay_month_cols = _scan_month_headers(wd_ws)
+        perf_month_cols = _scan_month_headers(md_ws)
+        payments_monthly = defaultdict(lambda: [0.0] * len(pay_month_cols))
+        performance_monthly = defaultdict(lambda: [0.0] * len(perf_month_cols))
 
         def collect_yearly(sheet, target_dict):
             for row in range(2, sheet.max_row + 1):
@@ -1995,16 +1989,15 @@ def run_code_2(file_bytes: bytes) -> bytes:
                     except:
                         pass
 
-        def collect_monthly_2025(sheet, target_dict):
-            start_col = column_index_from_string("AE")
+        def collect_monthly(sheet, target_dict, month_cols: List[Tuple[int, str]]):
             for row in range(2, sheet.max_row + 1):
                 n = sheet[f"A{row}"].value
                 c = sheet[f"B{row}"].value
                 if not n and not c:
                     continue
                 key = (str(n).strip() if n else "", str(c).strip() if c else "")
-                for i in range(12):
-                    v = sheet.cell(row=row, column=start_col + i).value
+                for i, (col_idx, _label) in enumerate(month_cols):
+                    v = sheet.cell(row=row, column=col_idx).value
                     if v is None:
                         continue
                     try:
@@ -2014,14 +2007,14 @@ def run_code_2(file_bytes: bytes) -> bytes:
 
         collect_yearly(wd_ws, payments_year)
         collect_yearly(md_ws, performance_year)
-        collect_monthly_2025(wd_ws, payments_2025_monthly)
-        collect_monthly_2025(md_ws, performance_2025_monthly)
+        collect_monthly(wd_ws, payments_monthly, pay_month_cols)
+        collect_monthly(md_ws, performance_monthly, perf_month_cols)
 
         all_keys = sorted(
             set(payments_year.keys())
             | set(performance_year.keys())
-            | set(payments_2025_monthly.keys())
-            | set(performance_2025_monthly.keys()),
+            | set(payments_monthly.keys())
+            | set(performance_monthly.keys()),
             key=lambda x: (x[0], x[1]),
         )
 
@@ -2035,28 +2028,29 @@ def run_code_2(file_bytes: bytes) -> bytes:
         ws["B2"] = "Договор"
 
         ws["C1"] = "оплата"
-        ws["C2"] = 2023
-        ws["D2"] = 2024
-        ws["E2"] = 2025
+        ws["C2"] = years_pay[0] or ""
+        ws["D2"] = years_pay[1] or ""
+        ws["E2"] = years_pay[2] or ""
         ws["F2"] = "Total"
 
         ws["G1"] = "выполнения с ндс"
-        ws["G2"] = 2023
-        ws["H2"] = 2024
-        ws["I2"] = 2025
+        ws["G2"] = years_perf[0] or ""
+        ws["H2"] = years_perf[1] or ""
+        ws["I2"] = years_perf[2] or ""
         ws["J2"] = "Total"
 
         ws["K2"] = "дз/(аванс)"
 
         ws["M1"] = "оплата"
-        months = [f"2025_{str(i).zfill(2)}" for i in range(1, 13)]
         start_col_pay = column_index_from_string("M")
-        for i, label in enumerate(months):
+        pay_month_labels = [lbl for _c, lbl in pay_month_cols]
+        for i, label in enumerate(pay_month_labels):
             ws[f"{get_column_letter(start_col_pay + i)}2"] = label
 
-        ws["Y1"] = "выполнения с ндс"
-        start_col_perf = column_index_from_string("Y")
-        for i, label in enumerate(months):
+        start_col_perf = start_col_pay + max(1, len(pay_month_labels))
+        ws[f"{get_column_letter(start_col_perf)}1"] = "выполнения с ндс"
+        perf_month_labels = [lbl for _c, lbl in perf_month_cols]
+        for i, label in enumerate(perf_month_labels):
             ws[f"{get_column_letter(start_col_perf + i)}2"] = label
 
         start_row = 3
@@ -2081,21 +2075,26 @@ def run_code_2(file_bytes: bytes) -> bytes:
             ws[f"D{row}"] = py[1]
             ws[f"E{row}"] = py[2]
 
-            ws[f"G{row}"] = pf[0] * 1.12
-            ws[f"H{row}"] = pf[1] * 1.12
-            ws[f"I{row}"] = pf[2] * 1.12
+            def _vat_coef_for_year(y: int) -> float:
+                # НДС 12% до 2025 включительно, 16% начиная с 2026 (и для лет > 2026 тоже 16%).
+                return 1.16 if int(y or 0) >= 2026 else 1.12
+
+            ws[f"G{row}"] = pf[0] * _vat_coef_for_year(years_perf[0])
+            ws[f"H{row}"] = pf[1] * _vat_coef_for_year(years_perf[1])
+            ws[f"I{row}"] = pf[2] * _vat_coef_for_year(years_perf[2])
 
             ws[f"F{row}"] = f"=SUM(C{row}:E{row})"
             ws[f"J{row}"] = f"=SUM(G{row}:I{row})"
             ws[f"K{row}"] = f"=J{row}-F{row}"
 
-            mp = payments_2025_monthly.get(key, [0] * 12)
-            for i in range(12):
+            mp = payments_monthly.get(key, [0.0] * len(pay_month_labels))
+            for i in range(len(pay_month_labels)):
                 ws[f"{get_column_letter(start_col_pay + i)}{row}"] = mp[i]
 
-            mf = performance_2025_monthly.get(key, [0] * 12)
-            for i in range(12):
-                ws[f"{get_column_letter(start_col_perf + i)}{row}"] = mf[i] * 1.12
+            mf = performance_monthly.get(key, [0.0] * len(perf_month_labels))
+            for i, label in enumerate(perf_month_labels):
+                y = _as_int_year(label.split("_", 1)[0]) or 0
+                ws[f"{get_column_letter(start_col_perf + i)}{row}"] = mf[i] * _vat_coef_for_year(y)
 
             row += 1
 
@@ -2104,25 +2103,26 @@ def run_code_2(file_bytes: bytes) -> bytes:
         regular = Font(name="Arial", size=10)
         bold = Font(name="Arial", size=10, bold=True)
 
-        for row in ws.iter_rows(min_row=1, max_row=last_row, min_col=1, max_col=column_index_from_string("AJ")):
+        last_col = max(start_col_perf + len(perf_month_labels) - 1, column_index_from_string("K"))
+        for row in ws.iter_rows(min_row=1, max_row=last_row, min_col=1, max_col=last_col):
             for c in row:
                 c.font = regular
 
-        for col in range(1, column_index_from_string("AJ") + 1):
+        for col in range(1, last_col + 1):
             ws[f"{get_column_letter(col)}2"].font = bold
-        for addr in ["A1", "C1", "G1", "M1", "Y1", "K2"]:
+        for addr in ["A1", "C1", "G1", "M1", f"{get_column_letter(start_col_perf)}1", "K2"]:
             ws[addr].font = bold
 
         center = Alignment(horizontal="center", vertical="center")
         left = Alignment(horizontal="left", vertical="center")
-        for col in range(1, column_index_from_string("AJ") + 1):
+        for col in range(1, last_col + 1):
             addr = f"{get_column_letter(col)}2"
             ws[addr].alignment = left if addr in ["A2", "B2"] else center
 
         num_format = "#,##0;[Red](#,##0)"
         numeric_cols = list("CDEFGHIJK")
-        numeric_cols += [get_column_letter(c) for c in range(start_col_pay, start_col_pay + 12)]
-        numeric_cols += [get_column_letter(c) for c in range(start_col_perf, start_col_perf + 12)]
+        numeric_cols += [get_column_letter(c) for c in range(start_col_pay, start_col_pay + len(pay_month_labels))]
+        numeric_cols += [get_column_letter(c) for c in range(start_col_perf, start_col_perf + len(perf_month_labels))]
 
         for col in numeric_cols:
             for r in range(3, last_row + 1):
@@ -2134,8 +2134,15 @@ def run_code_2(file_bytes: bytes) -> bytes:
             ws[f"A{r}"].alignment = left
             ws[f"B{r}"].alignment = left
 
-        for addr in ["C1", "G1", "M1", "Y1"]:
-            ws[addr].alignment = left
+        for addr in ["C1", "G1", "M1"]:
+            try:
+                ws[addr].alignment = left
+            except Exception:
+                pass
+        try:
+            ws[f"{get_column_letter(start_col_perf)}1"].alignment = left
+        except Exception:
+            pass
 
         ws.column_dimensions["A"].width = 38
         ws.column_dimensions["B"].width = 38
@@ -2143,7 +2150,7 @@ def run_code_2(file_bytes: bytes) -> bytes:
             ws.column_dimensions[col].width = 12.2 if column_index_from_string(col) >= start_col_pay else 12.6
 
         thin = Side(border_style="thin", color="000000")
-        border_cols = ["C", "G", "K", "M", "Y"]
+        border_cols = ["C", "G", "K", "M", get_column_letter(start_col_perf)]
         for r in range(1, last_row + 1):
             for col in border_cols:
                 cell = ws[f"{col}{r}"]
@@ -2564,36 +2571,21 @@ def run_code_5_insights(file_bytes: bytes) -> bytes:
 
 
 # =========================
-# Дизайн и тема (фон/цвета, тумблер темы)
+# ?????? ? ????
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
-# Переключатель темы: на странице, максимально ненавязчиво (справа сверху).
-_tcol_l, _tcol_r = st.columns([0.93, 0.07])
-with _tcol_r:
-    # Без подписи: только тумблер. Подсказка при наведении.
-    light_mode = st.toggle("", value=False, key="light_theme", help="Переключить тему (светлая/тёмная)", label_visibility="collapsed")
-
-if light_mode:
-    # Светлая тема (инверсия)
-    BG = "#FFFFFF"
-    TEXT = "#0B0B0B"
-    CARD = "#FFFFFF"
-    BORDER = "#D0D0D0"
-    MUTED = "#4D4D4D"
-    BTN_BG = "#FFFFFF"
-    BTN_TEXT = "#0B0B0B"
-    PROG = "#2F5FD7"
-else:
-    # Тёмная тема: чёрный фон, белый текст (как просили)
-    BG = "#000000"
-    TEXT = "#FFFFFF"
-    CARD = "#000000"
-    BORDER = "#3A3A3A"
-    MUTED = "#CFCFCF"
-    BTN_BG = "#000000"
-    BTN_TEXT = "#FFFFFF"
-    PROG = "#FFFFFF"
+# Тема (современный dark UI)
+BG = "#101824"          # фон (чуть светлее)
+BG_2 = "#141F2E"        # второй тон фона (градиент)
+TEXT = "#E9EEF5"        # основной текст
+MUTED = "#A7B3C4"       # подписи/вторичный текст
+CARD = "#0F1722"        # карточки/поля
+BORDER = "#223042"      # границы
+ACCENT = "#ADD6FF"      # акцент (кнопки)
+ACCENT_2 = "#2EE9A6"    # второй акцент (для подсветок)
+BTN_BG = ACCENT
+BTN_TEXT = "#000000"
 
 st.markdown(
     f"""
@@ -2602,73 +2594,54 @@ st.markdown(
       footer {{visibility: hidden;}}
       header {{visibility: hidden;}}
 
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap');
+
       .stApp {{
-        background: {BG};
+        background:
+          radial-gradient(900px 600px at 18% 12%, rgba(173, 214, 255, 0.18), transparent 55%),
+          radial-gradient(900px 600px at 78% 18%, rgba(46, 233, 166, 0.10), transparent 60%),
+          linear-gradient(180deg, {BG} 0%, {BG_2} 100%);
         color: {TEXT};
       }}
 
-      [data-testid="stSidebar"] {{
-        background: {BG};
-      }}
-
-      /* Keep default fonts; only set sizes and colors */
       html, body, [class*="css"], .stApp {{
         font-size: 15px !important;
-        font-family: "Cambria Math", "STIX Two Math", "Latin Modern Math", "Times New Roman", serif !important;
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
       }}
 
-      button, input, textarea, select, option {{
-        font-family: "Cambria Math", "STIX Two Math", "Latin Modern Math", "Times New Roman", serif !important;
-      }}
-
-      /* Headings/markdown containers sometimes override font-family */
-      h1, h2, h3, h4, h5, h6,
-      [data-testid="stMarkdownContainer"],
-      [data-testid="stMarkdownContainer"] * {{
-        font-family: "Cambria Math", "STIX Two Math", "Latin Modern Math", "Times New Roman", serif !important;
+      code, pre, kbd, samp {{
+        font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
       }}
 
       .block-container {{
-        max-width: 900px;
-        padding-top: 1.0rem;
-        padding-bottom: 1.2rem;
+        max-width: 980px;
+        padding-top: 1.25rem;
+        padding-bottom: 1.25rem;
       }}
 
-      /* Markdown headings used for section titles (####) */
       .stMarkdown h4 {{
         font-size: 18px !important;
-        margin: 0 0 0.35rem 0 !important;
+        margin: 0 0 0.55rem 0 !important;
+        color: {TEXT} !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.2px !important;
       }}
 
-      .card {{
-        background: {CARD};
-        border: 1px solid {BORDER};
-        border-radius: 14px;
-        padding: 18px;
+      /* Карточки/контейнеры */
+      [data-testid="stFileUploader"] section,
+      [data-testid="stForm"],
+      .stExpander,
+      [data-testid="stMetric"] {{
+        border-radius: 14px !important;
       }}
 
-      .title {{
-        font-size: 24px;
-        font-weight: 700;
-        margin: 0 0 12px 0;
-        color: {TEXT};
-      }}
-
-      .sub {{
-        margin: 0 0 14px 0;
-        color: {MUTED};
-        font-size: 16px;
-      }}
-
-      /* Inputs */
       [data-testid="stFileUploader"] section {{
-        border-radius: 12px;
-        padding: 12px;
-        border: 1px solid {BORDER};
+        padding: 14px;
+        border: 1px solid rgba(255,255,255,0.10);
         background: {CARD};
+        box-shadow: 0 10px 30px rgba(0,0,0,0.24);
       }}
-
-      /* File uploader text + button contrast */
       [data-testid="stFileUploader"] * {{
         color: {TEXT} !important;
       }}
@@ -2678,40 +2651,42 @@ st.markdown(
       [data-testid="stFileUploader"] button {{
         background: {BTN_BG} !important;
         color: {BTN_TEXT} !important;
-        border: 1px solid {BORDER} !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
         border-radius: 12px !important;
-        padding: 0.55rem 0.85rem !important;
+        padding: 0.60rem 0.90rem !important;
         font-weight: 700 !important;
+        transition: transform 120ms ease, filter 120ms ease !important;
       }}
-      /* File uploader "remove" (X) button */
+      [data-testid="stFileUploader"] button:hover {{
+        filter: brightness(1.05) !important;
+        transform: translateY(-1px) !important;
+      }}
       [data-testid="stFileUploaderDeleteBtn"] button {{
-        background: {BTN_BG} !important;
-        color: {BTN_TEXT} !important;
-        border: 1px solid {BORDER} !important;
+        background: rgba(255,255,255,0.06) !important;
+        color: #000000 !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
       }}
       [data-testid="stFileUploaderDeleteBtn"] svg {{
-        fill: {BTN_TEXT} !important;
-        color: {BTN_TEXT} !important;
+        fill: {TEXT} !important;
+        color: {TEXT} !important;
       }}
 
-      [role="radiogroup"] {{
-        border-radius: 12px;
-        padding: 12px 12px 8px 12px;
-        border: 1px solid {BORDER};
-        background: transparent;
-      }}
-
-      input, textarea {{
+      input, textarea, [data-baseweb="input"] input {{
         background: {CARD} !important;
         color: {TEXT} !important;
-        border-color: {BORDER} !important;
+        border-color: rgba(255,255,255,0.12) !important;
+        border-radius: 12px !important;
       }}
       input::placeholder, textarea::placeholder {{
         color: {MUTED} !important;
       }}
+      input:focus, textarea:focus, [data-baseweb="input"] input:focus {{
+        outline: none !important;
+        box-shadow: 0 0 0 3px rgba(173, 214, 255, 0.24) !important;
+        border-color: rgba(173, 214, 255, 0.55) !important;
+      }}
 
-      /* Buttons */
-      div.stButton > button {{
+      div.stButton > button, div.stDownloadButton > button {{
         width: 100%;
         border-radius: 12px !important;
         padding: 0.60rem 0.90rem !important;
@@ -2719,26 +2694,15 @@ st.markdown(
         font-size: 16px !important;
         background: {BTN_BG} !important;
         color: {BTN_TEXT} !important;
-        border: 1px solid {BORDER} !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
+        box-shadow: 0 12px 28px rgba(0,0,0,0.24);
+        transition: transform 120ms ease, filter 120ms ease !important;
+      }}
+      div.stButton > button:hover, div.stDownloadButton > button:hover {{
+        filter: brightness(1.06) !important;
+        transform: translateY(-1px) !important;
       }}
 
-      div.stDownloadButton > button {{
-        width: 100%;
-        border-radius: 12px !important;
-        padding: 0.60rem 0.90rem !important;
-        font-weight: 700 !important;
-        font-size: 16px !important;
-        background: {BTN_BG} !important;
-        color: {BTN_TEXT} !important;
-        border: 1px solid {BORDER} !important;
-      }}
-
-      /* Progress bar */
-      div[data-testid="stProgress"] > div > div {{
-        background-color: {PROG} !important;
-      }}
-
-      /* Text colors for markdown */
       .stMarkdown, .stMarkdown p, .stCaption, label {{
         color: {TEXT} !important;
       }}
@@ -2746,25 +2710,19 @@ st.markdown(
         color: {MUTED} !important;
       }}
 
-      /* Checkbox/toggle accents: make sure they are visible on both themes */
+      /* Чекбоксы/радио */
       [data-testid="stCheckbox"] * {{
         color: {TEXT} !important;
       }}
       input[type="checkbox"], input[type="radio"] {{
-        accent-color: {TEXT} !important;
+        accent-color: {ACCENT} !important;
       }}
 
-      /* Theme toggle: компактный, без лишних отступов */
-      div[data-testid="stToggle"] {{
-        padding-top: 0.15rem !important;
-      }}
-      div[data-testid="stToggle"] > label {{
-        justify-content: flex-end !important;
-        gap: 0.25rem !important;
-      }}
-      /* Track / knob colors */
-      div[data-testid="stToggle"] svg {{
-        color: {TEXT} !important;
+      /* Алерты */
+      [data-testid="stAlert"] {{
+        border-radius: 14px !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.18) !important;
       }}
     </style>
     """,
@@ -2872,14 +2830,14 @@ if analysis_wb_tmp is not None:
     for sh in analysis_wb_tmp.sheetnames:
         existing_suffixes.add(split_prefix_suffix4(sh)[1])
 
-    existing_saldo_info = list_existing_saldo_sheets_with_a1(analysis_wb_tmp)
-    if existing_saldo_info:
+    existing_osv_info = list_existing_osv_sheets_with_a1(analysis_wb_tmp)
+    if existing_osv_info:
         st.markdown("#### _Анализ: найденные ОСВ")
-        for sh, suf, a1 in existing_saldo_info[:12]:
+        for sh, suf, a1 in existing_osv_info[:12]:
             tail = f" | {_short(a1)}" if a1 else ""
             st.caption(f"{sh} → {suf}{tail}")
-        if len(existing_saldo_info) > 12:
-            st.caption(f"... и еще {len(existing_saldo_info) - 12}")
+        if len(existing_osv_info) > 12:
+            st.caption(f"... и еще {len(existing_osv_info) - 12}")
 
 # Находим все загруженные ОСВ-листы, у которых определился 4-значный номер счета.
 osv_items: List[Tuple[str, str, int, str, str]] = []
@@ -3044,13 +3002,14 @@ if "prepared_bytes" in st.session_state:
     st.markdown("#### Обработка")
 
     availability = st.session_state.get("availability") or {}
-    inv_map = availability.get("inventory_map") or {"1310": False, "1320": False, "1330": False}
+    inv_accounts_found = availability.get("inventory_accounts_found") or []
     saldo_ok = bool(availability.get("saldo_ok"))
     contracts_ok = bool(availability.get("contracts_ok"))
     kaz_ok = bool(availability.get("kaz_ok"))
     insights_ok = bool(availability.get("insights_ok"))
     insights_existing = availability.get("insights_existing_titles") or []
     insights_missing = availability.get("insights_missing_titles") or []
+    insights_legacy = availability.get("insights_legacy_titles") or []
 
     opt_kaz_obsh = st.checkbox("Обработка общей ОСВ", value=False, disabled=(not kaz_ok))
     if not kaz_ok:
@@ -3064,34 +3023,21 @@ if "prepared_bytes" in st.session_state:
     if not saldo_ok:
         st.caption("Сальдо недоступно: не найдены листы, заканчивающиеся на 1210/1710/3310/3510.")
 
-    inv_available_any = any(bool(v) for v in inv_map.values())
+    inv_available_any = bool(inv_accounts_found)
     opt_inventory = st.checkbox("Запасы", value=False, disabled=(not inv_available_any))
     if not inv_available_any:
-        st.caption("Запасы недоступны: не найдены листы по счетам 1310/1320/1330.")
+        st.caption("Запасы недоступны: не найдены ОСВ-листы по счетам 13**.")
 
-    inventory_accounts: List[str] = []
-    if opt_inventory:
-        st.caption("Счета запасов")
-        inv_1310 = st.checkbox("1310", value=False, disabled=(not inv_map.get("1310", False)))
-        inv_1320 = st.checkbox("1320", value=False, disabled=(not inv_map.get("1320", False)))
-        inv_1330 = st.checkbox("1330", value=False, disabled=(not inv_map.get("1330", False)))
-
-        if inv_1310:
-            inventory_accounts.append("1310")
-        if inv_1320:
-            inventory_accounts.append("1320")
-        if inv_1330:
-            inventory_accounts.append("1330")
-
-        if not inventory_accounts:
-            st.caption("Выберите минимум один счет: 1310 / 1320 / 1330.")
+    inventory_accounts: List[str] = inv_accounts_found if opt_inventory else []
 
     opt_insights = st.checkbox("Инсайты", value=False, disabled=(not insights_ok))
     if insights_existing:
-        st.warning("Инсайты уже есть в файле: " + ", ".join(insights_existing) + ". Повторно не генерирую.")
+        st.warning("Инс уже есть в файле: " + ", ".join(insights_existing) + ". Повторно не генерирую.")
+    if insights_legacy:
+        st.caption("Найдены старые листы «инсайты» — при запуске будут переименованы в «инс» и перенесены в конец файла.")
     if not insights_ok:
         if insights_existing:
-            st.caption("Инсайты недоступны: для всех найденных префиксов лист «инсайты» уже существует.")
+            st.caption("Инс недоступен: для всех найденных префиксов лист «инс» уже существует.")
         else:
             st.caption("Инсайты недоступны: нужны листы W, M, Mt, Wt (лист «общ» — только для блока 6).")
     elif insights_missing and insights_existing:
