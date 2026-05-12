@@ -1255,45 +1255,125 @@ def _write_block6(ws, row: int, *, ws_obsh, ws_m, ws_w) -> int:
 
 
 def generate_insights(file_bytes: bytes) -> bytes:
-    """Создаёт лист "инсайты". Если уже есть — не пересоздаёт."""
+    """
+    Создаёт лист(ы) "инс" на основе W/M/Wt/Mt (и общ/кред при наличии).
+    Поддерживает несколько компаний через префиксы в названиях листов.
+    Если лист уже есть (в т.ч. старое имя "инсайты") — не пересоздаёт.
+    """
     wb = _load_wb(file_bytes)
 
-    required = {"W", "M", "Wt", "Mt"}
-    if not required.issubset(set(wb.sheetnames)):
-        return file_bytes
+    def _norm_prefix(p: str) -> str:
+        return (p or "").strip()
 
-    if "инсайты" in wb.sheetnames:
-        return _save_wb(wb)
+    def _strip_counter_suffix(name: str) -> str:
+        # "Лист (2)" -> "Лист" (поддержка файлов, где Excel добавил счетчик)
+        return re.sub(r"\s*\(\d+\)\s*$", "", str(name or "")).strip()
 
-    ws = wb.create_sheet("инсайты", 0)
+    def _scan_prefix_to_sources() -> Dict[str, Dict[str, str]]:
+        """
+        Возвращает: prefix_norm -> {base: actual_sheet_name}
+        base in {"w","m","wt","mt","кред","общ"} (lower).
+        """
+        suffixes = ("wt", "mt", "w", "m", "кред", "общ")
+        out: Dict[str, Dict[str, str]] = {}
+        for sh in wb.sheetnames:
+            raw = str(sh)
+            nm = _strip_counter_suffix(raw)
+            low = nm.lower()
+            for suf in suffixes:
+                if not low.endswith(suf):
+                    continue
+                pref = _norm_prefix(nm[: -len(suf)])
+                out.setdefault(pref, {})
+                # для обязательных W/M/Wt/Mt сохраняем первый найденный вариант
+                out[pref].setdefault(suf, raw)
+                break
+        return out
 
-    # widths
-    ws.column_dimensions["A"].width = 2
-    ws.column_dimensions["B"].width = 50
-    for col in range(3, 15):
-        ws.column_dimensions[get_column_letter(col)].width = 16
+    def _desired_ins_title(prefix_norm: str) -> str:
+        base = "инс" if not prefix_norm else f"{prefix_norm}инс"
+        return base[:31]
 
-    # title
-    _write_row(ws, 1, ["ИНСАЙТЫ"], font=F_TITLE, align=A_LEFT)
+    def _legacy_ins_title(prefix_norm: str) -> str:
+        base = "инсайты" if not prefix_norm else f"инсайты {prefix_norm}"
+        return base[:31]
 
-    row = 3
-    ws_wt = wb["Wt"]
-    ws_mt = wb["Mt"]
-    ws_m = wb["M"]
-    ws_w = wb["W"]
-    ws_cred = wb["кред"] if "кред" in wb.sheetnames else None
+    def _move_sheet_to_end(ws) -> None:
+        try:
+            idx = wb.worksheets.index(ws)
+            last = len(wb.worksheets) - 1
+            if idx < last:
+                wb.move_sheet(ws, last - idx)
+        except Exception:
+            pass
 
-    row = _write_block1(ws, row, ws_wt=ws_wt, ws_cred=ws_cred)
-    row = _write_block2(ws, row, ws_m=ws_m)
-    row = _write_block3(ws, row, ws_w=ws_w)
-    row = _write_block4(ws, row, ws_mt=ws_mt, ws_wt=ws_wt)
-    row = _write_block5(ws, row, ws_wt=ws_wt)
+    prefix_to_src = _scan_prefix_to_sources()
+    required = {"w", "m", "wt", "mt"}
 
-    ws_obsh = wb["общ"] if "общ" in wb.sheetnames else None
-    if ws_obsh is None:
-        _write_row(ws, row, ["Блок 6 недоступен: лист «общ» не найден"] , font=F_HDR, align=A_LEFT)
-        row += 2
-    else:
-        row = _write_block6(ws, row, ws_obsh=ws_obsh, ws_m=ws_m, ws_w=ws_w)
+    any_changes = False
 
-    return _save_wb(wb)
+    # 1) Миграция: "инсайты" -> "инс" (и переносим в конец книги)
+    for prefix_norm in list(prefix_to_src.keys()) + [""]:
+        new_title = _desired_ins_title(prefix_norm)
+        legacy_title = _legacy_ins_title(prefix_norm)
+        if legacy_title in wb.sheetnames and new_title not in wb.sheetnames:
+            try:
+                ws_legacy = wb[legacy_title]
+                ws_legacy.title = new_title
+                _move_sheet_to_end(ws_legacy)
+                any_changes = True
+            except Exception:
+                pass
+
+    # 2) Генерация листов "инс" по всем найденным префиксам
+    for prefix_norm, src in prefix_to_src.items():
+        if not required.issubset(set(src.keys())):
+            continue
+
+        out_title = _desired_ins_title(prefix_norm)
+        legacy_title = _legacy_ins_title(prefix_norm)
+        if out_title in wb.sheetnames or legacy_title in wb.sheetnames:
+            # уже есть (или еще не мигрировали из-за коллизии) — ничего не делаем
+            continue
+
+        try:
+            ws = wb.create_sheet(out_title)  # по умолчанию в конец (важен порядок вкладок)
+            any_changes = True
+
+            # widths
+            ws.column_dimensions["A"].width = 2
+            ws.column_dimensions["B"].width = 50
+            for col in range(3, 15):
+                ws.column_dimensions[get_column_letter(col)].width = 16
+
+            # title
+            _write_row(ws, 1, ["ИНС"], font=F_TITLE, align=A_LEFT)
+
+            row = 3
+            ws_wt = wb[src["wt"]]
+            ws_mt = wb[src["mt"]]
+            ws_m = wb[src["m"]]
+            ws_w = wb[src["w"]]
+            ws_cred = wb[src["кред"]] if "кред" in src else None
+
+            row = _write_block1(ws, row, ws_wt=ws_wt, ws_cred=ws_cred)
+            row = _write_block2(ws, row, ws_m=ws_m)
+            row = _write_block3(ws, row, ws_w=ws_w)
+            row = _write_block4(ws, row, ws_mt=ws_mt, ws_wt=ws_wt)
+            row = _write_block5(ws, row, ws_wt=ws_wt)
+
+            ws_obsh = wb[src["общ"]] if "общ" in src else None
+            if ws_obsh is None:
+                _write_row(ws, row, ["Блок 6 недоступен: лист «общ» не найден"], font=F_HDR, align=A_LEFT)
+                row += 2
+            else:
+                row = _write_block6(ws, row, ws_obsh=ws_obsh, ws_m=ws_m, ws_w=ws_w)
+        except Exception:
+            # Если генерация не удалась, не оставляем "битый" лист.
+            try:
+                if out_title in wb.sheetnames:
+                    wb.remove(wb[out_title])
+            except Exception:
+                pass
+
+    return _save_wb(wb) if any_changes else file_bytes
