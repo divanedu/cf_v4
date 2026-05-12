@@ -2173,11 +2173,11 @@ def run_code_2(file_bytes: bytes) -> bytes:
 
 # =========================
 # CODE 3 (Запасы)
-# Для каждого выбранного счета (1310/1320/1330):
+# Для каждого выбранного счета 13**:
 # - находим лист(ы), где в названии встречается номер счета
 # - в листе ищем строку в колонке A, где ячейка равна номеру счета
-# - над блоком записываем пороги в J..N
-# - ниже заполняем формулы J..N до первой пустой ячейки в колонке G
+# - ставим I1=400 и суммарную "шапку" корзин в K6:O7 (как в эталонном файле)
+# - в колонке I проставляем формулу-классификацию по строкам до первой пустой в колонке G
 # Отдельных "отчётных" листов не создаём: UI показывает предупреждения по результату.
 # =========================
 def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes, Dict[str, List[str]]]:
@@ -2203,44 +2203,68 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
                 return r
         return None
 
-    def _set_percent(ws, row: int, col: int, value: float):
-        cell = ws.cell(row=row, column=col, value=value)
-        cell.number_format = "0%"
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+    def _apply_inventory_bucket_layout(ws) -> None:
+        """
+        Новая методика ликвидности запасов (как в эталонном файле):
+        - I1 = 400
+        - K6:O6 — корзины
+        - K7:O7 — суммы по корзинам через SUMIFS (G по значениям I)
+        """
+        ws["I1"].value = 400
+        ws["I1"].number_format = "#,##0"
+        ws["I1"].font = Font(name="Arial", size=8, bold=True, color="FF4B5563")  # тёмно-серый
+        ws["I1"].fill = PatternFill(fill_type="solid", fgColor="FFD9D9D9")  # светло-серый фон
+        ws["I1"].alignment = Alignment(horizontal="center")
 
-    def _set_number_style(cell, bold: bool = False, fill=None):
-        cell.number_format = "#,##0;[Red](#,##0)"
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        # Фиксируем размер шрифта для всех чисел J..N (включая суммы), чтобы Excel не "плясал" стилями.
-        cell.font = Font(name="Arial", size=9, bold=bold)
-        if fill is not None:
-            cell.fill = fill
+        labels = [
+            "0-1 мес",
+            "1-3 мес",
+            "3-6 мес",
+            "6-12 мес",
+            "ДТ BoP = 0",
+            "более 12 мес",
+            "Бесконечность (ост нач)",
+            "Бесконечность (обор ДТ)",
+        ]
+        cols = ["K", "L", "M", "N", "O", "P", "Q", "R"]
 
-    def _fill_formulas(ws, start_row: int, stop_row: int, thr_low: int, thr_high: int):
-        for r in range(start_row, stop_row + 1):
-            ratio = f"IFERROR($G{r}/$F{r},100)"
-            ws.cell(row=r, column=10).value = f"=IF({ratio}>J${thr_low},$G{r},0)"
-            ws.cell(row=r, column=11).value = (
-                f"=IF({ratio}>K${thr_low},IF({ratio}<=K${thr_high},$G{r},0),0)"
-            )
-            ws.cell(row=r, column=12).value = (
-                f"=IF({ratio}>L${thr_low},IF({ratio}<=L${thr_high},$G{r},0),0)"
-            )
-            ws.cell(row=r, column=13).value = (
-                f"=IF({ratio}>M${thr_low},IF({ratio}<=M${thr_high},$G{r},0),0)"
-            )
-            ws.cell(row=r, column=14).value = (
-                f"=IF({ratio}>N${thr_low},IF({ratio}<=N${thr_high},$G{r},0),0)"
-            )
-            for c in range(10, 15):
-                _set_number_style(ws.cell(row=r, column=c))
+        fill_hdr = PatternFill(fill_type="solid", fgColor="E4F0DD")
+        font_hdr = Font(name="Aptos Narrow", size=9, bold=True, color="003F2F")
+        align_hdr = Alignment(horizontal="center", vertical="top", wrap_text=True)
+        thin = Side(border_style="thin", color="000000")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    def _apply_dotted_grid(ws, row_from: int, row_to: int, col_from: int, col_to: int):
-        side = Side(border_style="dotted", color="000000")
-        border = Border(left=side, right=side, top=side, bottom=side)
-        for r in range(row_from, row_to + 1):
-            for c in range(col_from, col_to + 1):
-                ws.cell(row=r, column=c).border = border
+        for col, label in zip(cols, labels):
+            c = ws[f"{col}6"]
+            c.value = label
+            c.font = font_hdr
+            c.fill = fill_hdr
+            c.alignment = align_hdr
+            c.border = border
+            c.number_format = "#,##0.00"
+
+        font_sum = Font(name="Aptos Narrow", size=9, bold=True)
+        align_sum = Alignment(horizontal="center")
+        for col in cols:
+            c = ws[f"{col}7"]
+            c.value = f"=SUMIFS($G:$G,$I:$I,{col}6)"
+            c.font = font_sum
+            c.alignment = align_sum
+            c.number_format = "#,##0"
+
+    def _bucket_formula_for_row(r: int) -> str:
+        return (
+            f'=IF(G{r}=0,\"Нет остатка\",\n'
+            f' IF(G{r}<0,\"Отрицательное\",\n'
+            f' IF(C{r}=0,\"ДТ BoP = 0\",\n'
+            f' IF(AND(F{r}=0,C{r}<>0,E{r}=0,G{r}=C{r}),\"Бесконечность (ост нач)\",\n'
+            f' IF(AND(F{r}=0,C{r}<>0,E{r}<>0),\"Бесконечность (обор ДТ)\",\n'
+            f' _xlfn.LET(_xlpm.turn,$I$1*(G{r}/F{r}),\n'
+            f'     IF(_xlpm.turn<=31,\"0-1 мес\",\n'
+            f'        IF(_xlpm.turn<=92,\"1-3 мес\",\n'
+            f'           IF(_xlpm.turn<=183,\"3-6 мес\",\n'
+            f'              IF(_xlpm.turn<=366,\"6-12 мес\",\"более 12 мес\"))))))))))'
+        )
 
     for account in accounts:
         matched_sheets = [sh for sh in wb.sheetnames if account in sh]
@@ -2255,47 +2279,28 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
                 missing_markers.append(f"{account}: {sh}")
                 continue
 
-            thr_low = found_row - 3
-            thr_high = found_row - 2
-            if thr_low < 1 or thr_high < 1:
-                missing_markers.append(f"{account}: {sh} (слишком близко к началу листа)")
-                continue
-
-            # Пороговые значения (в Excel проценты храним как доли: 2.0 = 200%).
-            _set_percent(ws, thr_low, 10, 2.0)   # J: 200%
-            _set_percent(ws, thr_low, 11, 1.0)   # K: 100%
-            _set_percent(ws, thr_high, 11, 2.0)  # K: 200%
-            _set_percent(ws, thr_low, 12, 0.5)   # L: 50%
-            _set_percent(ws, thr_high, 12, 1.0)  # L: 100%
-            _set_percent(ws, thr_low, 13, 0.25)  # M: 25%
-            _set_percent(ws, thr_high, 13, 0.5)  # M: 50%
-            _set_percent(ws, thr_low, 14, 0.0)   # N: 0%
-            _set_percent(ws, thr_high, 14, 0.25) # N: 25%
+            _apply_inventory_bucket_layout(ws)
 
             # Заполняем формулы по строкам запасов: от строки ниже маркера до первой пустой в колонке G.
             start_row = found_row + 1
             last = start_row - 1
             for r in range(start_row, ws.max_row + 1):
+                # Останавливаемся перед строкой "Итого" (чтобы не тянуть хвосты/сводные строки в запасы).
+                a = ws.cell(row=r, column=1).value
+                if a is not None and "итого" in str(a).strip().lower():
+                    break
                 g = ws.cell(row=r, column=7).value
                 if _is_blank(g):
                     break
                 last = r
 
             if last >= start_row:
-                _fill_formulas(ws, start_row, last, thr_low, thr_high)
-                # Суммы ставим в строке, где найден номер счета (та же строка, что A=1310/1320/1330).
-                total_fill = PatternFill(fill_type="solid", fgColor="C6EFCE")
-                for col_letter, col_idx in [("J", 10), ("K", 11), ("L", 12), ("M", 13), ("N", 14)]:
-                    cell = ws.cell(row=found_row, column=col_idx)
-                    cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{last})"
-                    _set_number_style(cell, bold=True, fill=total_fill)
-
-                # Пунктирная рамка вокруг мини-таблицы (пороги + суммы + строки данных).
-                _apply_dotted_grid(ws, thr_low, last, 10, 14)
+                for rr in range(start_row, last + 1):
+                    c = ws.cell(row=rr, column=9)  # I
+                    c.value = _bucket_formula_for_row(rr)
+                    c.font = Font(name="Arial", size=8)
                 processed.append(f"{account}: {sh} (строки {start_row}-{last})")
             else:
-                # Если данных нет — рамку всё равно рисуем вокруг порогов + строки сумм.
-                _apply_dotted_grid(ws, thr_low, found_row, 10, 14)
                 processed.append(f"{account}: {sh} (нет строк с данными в G ниже маркера)")
 
     out = io.BytesIO()
@@ -2576,16 +2581,18 @@ def run_code_5_insights(file_bytes: bytes) -> bytes:
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
 # Тема (современный dark UI)
-BG = "#101824"          # фон (чуть светлее)
-BG_2 = "#141F2E"        # второй тон фона (градиент)
+BG = "#101824"          # фон
+BG_2 = "#101824"        # без градиента
 TEXT = "#E9EEF5"        # основной текст
 MUTED = "#A7B3C4"       # подписи/вторичный текст
 CARD = "#0F1722"        # карточки/поля
 BORDER = "#223042"      # границы
-ACCENT = "#ADD6FF"      # акцент (кнопки)
+ACCENT = "#ADD6FF"      # акцент (чекбоксы/фокус)
 ACCENT_2 = "#2EE9A6"    # второй акцент (для подсветок)
-BTN_BG = ACCENT
-BTN_TEXT = "#000000"
+BTN_BG = "#163042"      # кнопки (тёмный сине-серый)
+BTN_TEXT = TEXT         # текст кнопок (светлый)
+BTN_BORDER = "rgba(255,255,255,0.12)"
+BTN_HOVER = "#1B3A50"
 
 st.markdown(
     f"""
@@ -2596,22 +2603,25 @@ st.markdown(
 
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
       @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap');
+      @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&display=swap');
 
       .stApp {{
-        background:
-          radial-gradient(900px 600px at 18% 12%, rgba(173, 214, 255, 0.18), transparent 55%),
-          radial-gradient(900px 600px at 78% 18%, rgba(46, 233, 166, 0.10), transparent 60%),
-          linear-gradient(180deg, {BG} 0%, {BG_2} 100%);
+        background: {BG};
         color: {TEXT};
       }}
 
       html, body, [class*="css"], .stApp {{
         font-size: 15px !important;
-        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
+        font-family: "Playfair Display", Georgia, "Times New Roman", serif !important;
       }}
 
-      code, pre, kbd, samp {{
-        font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+      /* Streamlit/BaseWeb часто задают шрифты точечно — фиксируем на всей типографике. */
+      button, input, textarea, select, option,
+      label,
+      [data-baseweb],
+      [data-baseweb] *,
+      [data-testid] * {{
+        font-family: "Playfair Display", Georgia, "Times New Roman", serif !important;
       }}
 
       .block-container {{
@@ -2640,7 +2650,7 @@ st.markdown(
         padding: 14px;
         border: 1px solid rgba(255,255,255,0.10);
         background: {CARD};
-        box-shadow: 0 10px 30px rgba(0,0,0,0.24);
+        box-shadow: none;
       }}
       [data-testid="stFileUploader"] * {{
         color: {TEXT} !important;
@@ -2648,23 +2658,70 @@ st.markdown(
       [data-testid="stFileUploader"] small {{
         color: {MUTED} !important;
       }}
-      [data-testid="stFileUploader"] button {{
+
+      /* Универсальные кнопки (Streamlit / BaseWeb / kind=primary/secondary) */
+      div.stButton > button,
+      div.stDownloadButton > button,
+      button[kind="primary"],
+      button[kind="secondary"],
+      div[data-baseweb="button"] > button,
+      div[data-baseweb="button"] button {{
         background: {BTN_BG} !important;
         color: {BTN_TEXT} !important;
-        border: 1px solid rgba(255,255,255,0.10) !important;
+        border: 1px solid {BTN_BORDER} !important;
         border-radius: 12px !important;
         padding: 0.60rem 0.90rem !important;
         font-weight: 700 !important;
-        transition: transform 120ms ease, filter 120ms ease !important;
+        box-shadow: none !important;
+        transition: transform 120ms ease, filter 120ms ease, background-color 120ms ease !important;
       }}
-      [data-testid="stFileUploader"] button:hover {{
-        filter: brightness(1.05) !important;
+      div.stButton > button:hover,
+      div.stDownloadButton > button:hover,
+      button[kind="primary"]:hover,
+      button[kind="secondary"]:hover,
+      div[data-baseweb="button"] > button:hover,
+      div[data-baseweb="button"] button:hover {{
+        background: {BTN_HOVER} !important;
         transform: translateY(-1px) !important;
       }}
+      div.stButton > button:active,
+      div.stDownloadButton > button:active,
+      button[kind="primary"]:active,
+      button[kind="secondary"]:active,
+      div[data-baseweb="button"] > button:active,
+      div[data-baseweb="button"] button:active {{
+        transform: translateY(0px) !important;
+        filter: brightness(0.98) !important;
+      }}
+      div.stButton > button:focus-visible,
+      div.stDownloadButton > button:focus-visible,
+      button[kind="primary"]:focus-visible,
+      button[kind="secondary"]:focus-visible,
+      div[data-baseweb="button"] > button:focus-visible,
+      div[data-baseweb="button"] button:focus-visible {{
+        outline: none !important;
+        box-shadow: 0 0 0 3px rgba(173, 214, 255, 0.22) !important;
+        border-color: rgba(173, 214, 255, 0.55) !important;
+      }}
+
+      /* Uploader: в разных версиях кнопка живёт в dropzone/section */
+      [data-testid="stFileUploader"] button,
+      [data-testid="stFileUploaderDropzone"] button {{
+        background: {BTN_BG} !important;
+        color: {BTN_TEXT} !important;
+        border: 1px solid {BTN_BORDER} !important;
+        border-radius: 12px !important;
+        font-weight: 700 !important;
+      }}
+      [data-testid="stFileUploader"] button:hover,
+      [data-testid="stFileUploaderDropzone"] button:hover {{
+        background: {BTN_HOVER} !important;
+      }}
+
       [data-testid="stFileUploaderDeleteBtn"] button {{
         background: rgba(255,255,255,0.06) !important;
-        color: #000000 !important;
-        border: 1px solid rgba(255,255,255,0.10) !important;
+        color: {TEXT} !important;
+        border: 1px solid {BTN_BORDER} !important;
       }}
       [data-testid="stFileUploaderDeleteBtn"] svg {{
         fill: {TEXT} !important;
@@ -2686,21 +2743,10 @@ st.markdown(
         border-color: rgba(173, 214, 255, 0.55) !important;
       }}
 
+      /* Ширина для основных action-кнопок */
       div.stButton > button, div.stDownloadButton > button {{
         width: 100%;
-        border-radius: 12px !important;
-        padding: 0.60rem 0.90rem !important;
-        font-weight: 700 !important;
         font-size: 16px !important;
-        background: {BTN_BG} !important;
-        color: {BTN_TEXT} !important;
-        border: 1px solid rgba(255,255,255,0.10) !important;
-        box-shadow: 0 12px 28px rgba(0,0,0,0.24);
-        transition: transform 120ms ease, filter 120ms ease !important;
-      }}
-      div.stButton > button:hover, div.stDownloadButton > button:hover {{
-        filter: brightness(1.06) !important;
-        transform: translateY(-1px) !important;
       }}
 
       .stMarkdown, .stMarkdown p, .stCaption, label {{
@@ -2722,7 +2768,7 @@ st.markdown(
       [data-testid="stAlert"] {{
         border-radius: 14px !important;
         border: 1px solid rgba(255,255,255,0.10) !important;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.18) !important;
+        box-shadow: none !important;
       }}
     </style>
     """,
