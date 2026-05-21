@@ -398,13 +398,23 @@ def _write_block1(ws, row: int, *, ws_wt, ws_cred=None) -> int:
     _write_row(ws, row, ["Контрагент", "Лист", "Таблица", "Направление", "Итого"], font=F_HDR, fill=FILL_HDR, align=A_LEFT)
     row += 1
 
+    def _detect_total_col(sheet, header_row: int) -> int:
+        max_c = int(sheet.max_column or 1)
+        for c in range(1, max_c + 1):
+            v = _as_text(sheet.cell(row=header_row, column=c).value).strip().lower()
+            if v in {"итог", "итого", "total"}:
+                return c
+        return 29
+
     wt_excl = {"Прочая ДЗ/КЗ Inflow", "Прочая ДЗ/КЗ Outflow"}
-    wt_tables = _parse_tables_generic(ws_wt, start_row=3, name_col=2, first_month_col=3, total_col=29, exclude_tables=wt_excl)
+    wt_total_col = _detect_total_col(ws_wt, 3)
+    wt_tables = _parse_tables_generic(ws_wt, start_row=3, name_col=2, first_month_col=3, total_col=wt_total_col, exclude_tables=wt_excl)
 
     cred_tables: List[dict] = []
     if ws_cred is not None:
         cred_include = {"Краткосрочные кредиты (Netto)", "Долгосрочные кредиты (Netto)"}
-        cred_tables = _parse_tables_generic(ws_cred, start_row=5, name_col=2, first_month_col=3, total_col=29, include_tables=cred_include)
+        cred_total_col = _detect_total_col(ws_cred, 5)
+        cred_tables = _parse_tables_generic(ws_cred, start_row=5, name_col=2, first_month_col=3, total_col=cred_total_col, include_tables=cred_include)
 
     occ: Dict[str, List[Tuple[str, str, float]]] = {}
     for t in wt_tables:
@@ -659,22 +669,33 @@ def _parse_mt(ws_mt) -> Tuple[List[Tuple[str, float]], float]:
     total = 0.0
     max_r = int(ws_mt.max_row or 1)
 
+    def _detect_total_col(header_row: int) -> int:
+        max_c = int(ws_mt.max_column or 1)
+        for c in range(1, max_c + 1):
+            v = _as_text(ws_mt.cell(row=header_row, column=c).value).strip().lower()
+            if v in {"итог", "итого", "total"}:
+                return c
+        # fallback: старые файлы
+        return 29
+
+    total_col = _detect_total_col(5)
+
     for r in range(6, max_r + 1):
         name = _as_text(ws_mt.cell(row=r, column=2).value).strip()
         if not name:
             break
         if name == "Всего":
-            total = _to_float(ws_mt.cell(row=r, column=29).value)
+            total = _to_float(ws_mt.cell(row=r, column=total_col).value)
             break
         if name in {"Топ", "Доля"}:
             break
-        cps.append((name, _to_float(ws_mt.cell(row=r, column=29).value)))
+        cps.append((name, _to_float(ws_mt.cell(row=r, column=total_col).value)))
 
     if total == 0.0:
         for r in range(6, max_r + 1):
             name = _as_text(ws_mt.cell(row=r, column=2).value).strip()
             if name == "Всего":
-                total = _to_float(ws_mt.cell(row=r, column=29).value)
+                total = _to_float(ws_mt.cell(row=r, column=total_col).value)
                 break
 
     return cps, total
@@ -696,6 +717,20 @@ def _parse_wt_clients(ws_wt) -> Tuple[List[Tuple[str, float]], float, List[float
     if header_r is None:
         return [], 0.0, [0.0] * 12, [0.0] * 12
 
+    def _detect_cols() -> Tuple[List[Tuple[int, str]], int]:
+        max_c = int(ws_wt.max_column or 1)
+        month_cols: List[Tuple[int, str]] = []
+        total_col = 29
+        for c in range(1, max_c + 1):
+            v = _as_text(ws_wt.cell(row=header_r, column=c).value).strip()
+            if re.fullmatch(r"\d{4}_\d{2}", v):
+                month_cols.append((c, v))
+            if v.strip().lower() in {"итог", "итого", "total"}:
+                total_col = c
+        return month_cols, total_col
+
+    month_cols, total_col = _detect_cols()
+
     cps: List[Tuple[str, float]] = []
     total_all = 0.0
     max_r = int(ws_wt.max_row or 1)
@@ -705,17 +740,25 @@ def _parse_wt_clients(ws_wt) -> Tuple[List[Tuple[str, float]], float, List[float
         nm = _as_text(ws_wt.cell(row=r, column=2).value).strip()
         if nm in {"Топ", "Всего", "Доля", ""}:
             break
-        cps.append((nm, _to_float(ws_wt.cell(row=r, column=29).value)))
+        cps.append((nm, _to_float(ws_wt.cell(row=r, column=total_col).value)))
         r += 1
 
     rr = header_r + 1
     while rr <= max_r:
         nm = _as_text(ws_wt.cell(row=rr, column=2).value).strip()
         if nm == "Всего":
-            total_all = _to_float(ws_wt.cell(row=rr, column=29).value)
-            m2025 = [_to_float(ws_wt.cell(row=rr, column=c).value) for c in range(3, 15)]   # C..N
-            m2026 = [_to_float(ws_wt.cell(row=rr, column=c).value) for c in range(15, 27)]  # O..Z
-            return cps, total_all, m2025, m2026
+            total_all = _to_float(ws_wt.cell(row=rr, column=total_col).value)
+            # Возвращаем помесячно 2025 и 2026 (если есть), иначе — нули.
+            year_to_vals: Dict[int, List[float]] = {2025: [0.0] * 12, 2026: [0.0] * 12}
+            for c, lab in month_cols:
+                try:
+                    y = int(lab[:4])
+                    m = int(lab[5:])
+                except Exception:
+                    continue
+                if y in year_to_vals and 1 <= m <= 12:
+                    year_to_vals[y][m - 1] = _to_float(ws_wt.cell(row=rr, column=c).value)
+            return cps, total_all, year_to_vals[2025], year_to_vals[2026]
         if nm == "Доля":
             break
         rr += 1
@@ -1274,20 +1317,31 @@ def generate_insights(file_bytes: bytes) -> bytes:
         Возвращает: prefix_norm -> {base: actual_sheet_name}
         base in {"w","m","wt","mt","кред","общ"} (lower).
         """
-        suffixes = ("wt", "mt", "w", "m", "кред", "общ")
+        suffixes = ("wt", "mt", "w", "m", "кред")
         out: Dict[str, Dict[str, str]] = {}
         for sh in wb.sheetnames:
             raw = str(sh)
             nm = _strip_counter_suffix(raw)
             low = nm.lower()
+            matched = False
             for suf in suffixes:
-                if not low.endswith(suf):
-                    continue
-                pref = _norm_prefix(nm[: -len(suf)])
+                if low.endswith(suf):
+                    pref = _norm_prefix(nm[: -len(suf)])
+                    out.setdefault(pref, {})
+                    out[pref].setdefault(suf, raw)
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            # "общ" может быть как "общ", так и "общ26"/"общ25" (с префиксом или без)
+            m = re.search(r"(общ)(\d{2})$", low)
+            if low.endswith("общ") or m:
+                suf_len = 3 if low.endswith("общ") else 5
+                pref = _norm_prefix(nm[: -suf_len])
                 out.setdefault(pref, {})
-                # для обязательных W/M/Wt/Mt сохраняем первый найденный вариант
-                out[pref].setdefault(suf, raw)
-                break
+                # предпочитаем "общ" (без года), но если его нет — берём "общNN"
+                out[pref].setdefault("общ", raw)
         return out
 
     def _desired_ins_title(prefix_norm: str) -> str:
