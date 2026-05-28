@@ -1034,8 +1034,9 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
 
     saldo_ok = any(split_prefix_suffix4(sh)[1] in saldo_suffixes for sh in wb.sheetnames)
 
-    # ОСВ "общ" (казахстанская ОСВ) — для неё нужен справочник "Счета каз"
-    kaz_ok = ("общ" in wb.sheetnames) and ("Счета каз" in wb.sheetnames)
+    # "общ*" (общая ОСВ) — для чистой прибыли достаточно наличия хотя бы одного такого листа
+    obsh_sheets = [sh for sh in wb.sheetnames if "общ" in str(sh).lower()]
+    profit_ok = bool(obsh_sheets)
 
     prefix_to_pair: Dict[str, Dict[str, str]] = defaultdict(dict)
     for sh in wb.sheetnames:
@@ -1086,7 +1087,8 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
         "saldo_ok": saldo_ok,
         "contracts_ok": contracts_ok,
         "contracts_prefixes": contracts_prefixes,
-        "kaz_ok": kaz_ok,
+        "profit_ok": profit_ok,
+        "obsh_sheets": obsh_sheets,
         "insights_ok": insights_ok,
         "insights_prefixes": insights_prefixes,
         "insights_existing_titles": insights_existing_titles,
@@ -2010,7 +2012,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 contr,
                 int(round(float(r0.get("1210_нач", 0) or 0))),
                 int(round(float(r0.get("3510_нач", 0) or 0))),
-                int(round(float(r0.get("нетто_нач", 0) or 0))),
+                abs(int(round(float(r0.get("нетто_нач", 0) or 0)))),
                 int(round(float(r0.get("оборот_дт", 0) or 0))),
                 int(round(float(r0.get("оборот_кт", 0) or 0))),
                 int(round(float(r0.get("1210", 0) or 0))),
@@ -2107,7 +2109,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 contr,
                 int(round(float(r0.get("1710_нач", 0) or 0))),
                 int(round(float(r0.get("3310_нач", 0) or 0))),
-                int(round(float(r0.get("нетто_нач", 0) or 0))),
+                abs(int(round(float(r0.get("нетто_нач", 0) or 0)))),
                 int(round(float(r0.get("оборот_дт", 0) or 0))),
                 int(round(float(r0.get("оборот_кт", 0) or 0))),
                 int(round(float(r0.get("1710", 0) or 0))),
@@ -2698,251 +2700,275 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
 
 
 # =========================
-# CODE 4 (Обработка общей ОСВ / Казахстан)
-# Работает по листу "общ" и использует справочник "Счета каз".
-# ВАЖНО: мы записываем именно формулы (строки начинающиеся с "="),
-# поэтому в выходном Excel они будут видны как формулы.
+# CODE 4 (Чистая прибыль по "общ*")
+# Рассчитывает ЧП из движения денег (1030), исключая CFF/CFI/NWC/Амортизацию.
+# Для каждого выбранного листа "общ*" добавляет справа-внизу таблицу (формулами INDEX/MATCH).
 # =========================
-def run_code_4_obsh_kaz(file_bytes: bytes) -> bytes:
+def run_code_4_net_profit(file_bytes: bytes, obsh_sheetnames: List[str]) -> bytes:
     wb = load_workbook(io.BytesIO(file_bytes))
 
-    if "общ" not in wb.sheetnames:
-        raise ValueError("Обработка общей ОСВ: не найден лист «общ».")
-    if "Счета каз" not in wb.sheetnames:
-        raise ValueError("Обработка общей ОСВ: не найден лист «Счета каз».")
+    if not obsh_sheetnames:
+        raise ValueError("Чистая прибыль: не выбраны листы «общ*».")
 
-    ws = wb["общ"]
+    for sh in obsh_sheetnames:
+        if sh not in wb.sheetnames:
+            raise ValueError(f"Чистая прибыль: лист не найден: {sh}")
 
-    # На листе "общ" иногда есть объединённые ячейки (merged). openpyxl возвращает для них MergedCell,
-    # и попытка записать .value в такую ячейку падает (read-only). Поэтому все записи делаем "безопасно":
-    # если целевая ячейка входит в merged-диапазон — записываем в левую-верхнюю ячейку этого диапазона.
-    merged_ranges = list(getattr(ws.merged_cells, "ranges", []) or [])
+    def _is_blank(v) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str) and not v.strip():
+            return True
+        return False
 
-    def _merge_topleft(row: int, col: int) -> Optional[Tuple[int, int]]:
-        for mr in merged_ranges:
-            if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
-                return (mr.min_row, mr.min_col)
+    def _excel_sheet_ref(title: str) -> str:
+        # Excel-референс листа в формулах: 'Лист 1'!A1. Одинарные кавычки внутри имени удваиваем.
+        t = str(title).replace("'", "''")
+        return f"'{t}'"
+
+    def _find_last_used_col_in_header(ws) -> int:
+        maxc = 1
+        top = min(int(ws.max_row or 1), 12)
+        for r in range(1, top + 1):
+            for c in range(1, int(ws.max_column or 1) + 1):
+                v = ws.cell(row=r, column=c).value
+                if not _is_blank(v):
+                    maxc = max(maxc, c)
+        return maxc
+
+    def _find_last_used_row_in_col_a(ws) -> int:
+        max_scan = min(int(ws.max_row or 1), 10000)
+        last = 1
+        for r in range(1, max_scan + 1):
+            if not _is_blank(ws.cell(row=r, column=1).value):
+                last = r
+        return last
+
+    def _find_debit_credit_pairs(ws) -> Tuple[int, int, int, int, int, int]:
+        """
+        Возвращает (bop_deb, bop_cred, turn_deb, turn_cred, eop_deb, eop_cred) — номера колонок.
+        Ищем строку заголовков, где встречаются "Дебет"/"Кредит" 3 раза подряд (6 колонок).
+        """
+        # Ищем по верхним строкам (обычно 4..8).
+        best_row = None
+        for r in range(1, 20):
+            deb_cols = []
+            cred_cols = []
+            for c in range(1, int(ws.max_column or 1) + 1):
+                v = ws.cell(row=r, column=c).value
+                if v is None:
+                    continue
+                s = str(v).strip().lower()
+                if "дебет" == s or s.startswith("дебет"):
+                    deb_cols.append(c)
+                if "кредит" == s or s.startswith("кредит"):
+                    cred_cols.append(c)
+            # Кандидат: минимум 3 дебета и 3 кредита, и они идут вперемешку по возрастанию.
+            if len(deb_cols) >= 3 and len(cred_cols) >= 3:
+                best_row = r
+                break
+
+        if best_row is None:
+            raise ValueError(f"Чистая прибыль ({ws.title}): не нашёл заголовки «Дебет/Кредит» (3 пары) в верхней части листа.")
+
+        labels = []
+        for c in range(1, int(ws.max_column or 1) + 1):
+            v = ws.cell(row=best_row, column=c).value
+            if v is None:
+                continue
+            s = str(v).strip().lower()
+            if s.startswith("дебет"):
+                labels.append((c, "D"))
+            elif s.startswith("кредит"):
+                labels.append((c, "C"))
+        labels.sort(key=lambda x: x[0])
+
+        # Берём первые 6 в формате D,C,D,C,D,C
+        seq = []
+        for c, t in labels:
+            if not seq:
+                if t == "D":
+                    seq.append((c, t))
+            else:
+                want = "C" if seq[-1][1] == "D" else "D"
+                if t == want:
+                    seq.append((c, t))
+            if len(seq) == 6:
+                break
+
+        if len(seq) < 6 or [t for _c, t in seq] != ["D", "C", "D", "C", "D", "C"]:
+            raise ValueError(f"Чистая прибыль ({ws.title}): не смог определить 3 пары «Дебет/Кредит» из заголовков.")
+
+        bop_deb, bop_cred, turn_deb, turn_cred, eop_deb, eop_cred = [c for c, _t in seq]
+        return bop_deb, bop_cred, turn_deb, turn_cred, eop_deb, eop_cred
+
+    def _find_account_row(ws, acc: str) -> Optional[int]:
+        max_scan = min(int(ws.max_row or 1), 10000)
+        for r in range(3, max_scan + 1):
+            v = ws.cell(row=r, column=1).value
+            if v is None:
+                continue
+            if acc in str(v):
+                return r
         return None
 
-    def _safe_set_value(row: int, col: int, value) -> None:
-        cell = ws.cell(row=row, column=col)
-        if isinstance(cell, MergedCell):
-            tl = _merge_topleft(row, col)
-            if not tl:
-                return
-            ws.cell(row=tl[0], column=tl[1]).value = value
-            return
-        cell.value = value
+    def _name_or_acc(ws, row: Optional[int], acc: str) -> str:
+        if row is None:
+            return acc
+        v = ws.cell(row=row, column=1).value
+        return str(v).strip() if v is not None else acc
 
-    # Ищем строку "Итого" по колонке A.
-    # Важно: в ОСВ могут встречаться промежуточные "Итого" внутри разделов,
-    # поэтому берём ПОСЛЕДНЕЕ вхождение в пределах разумного диапазона.
-    itogo_row = None
-    max_scan = min(max(ws.max_row, 1), 5000)
-    for r in range(8, max_scan + 1):
-        v = ws.cell(row=r, column=1).value
-        if v is None:
-            continue
-        s = str(v).strip()
-        if "Итого" in s:
-            itogo_row = r
-    if itogo_row is None:
-        raise ValueError("Обработка общей ОСВ: не найдена строка «Итого» в колонке A (до 5000 строки).")
+    def _delta_formula(sheet_ref: str, acc_row: int, cols: Tuple[int, int, int, int, int, int]) -> str:
+        bop_d, bop_c, _t_d, _t_c, eop_d, eop_c = cols
+        # Δ = (Кт_кон - Кт_нач) - (Дт_кон - Дт_нач)
+        bd = f"INDEX({sheet_ref}!$1:$1048576,{acc_row},{bop_d})"
+        bc = f"INDEX({sheet_ref}!$1:$1048576,{acc_row},{bop_c})"
+        ed = f"INDEX({sheet_ref}!$1:$1048576,{acc_row},{eop_d})"
+        ec = f"INDEX({sheet_ref}!$1:$1048576,{acc_row},{eop_c})"
+        return f"=(({ec})-({bc}))-(({ed})-({bd}))"
 
-    last_data_row = itogo_row - 1
-    if last_data_row < 8:
-        raise ValueError("Обработка общей ОСВ: нет строк данных (ожидается минимум с 8 строки).")
+    thin_black = Side(style="thin", color="000000")
+    dotted_gray = Side(style="dotted", color="A0A0A0")
+    header_fill = PatternFill("solid", fgColor="EDEDED")
+    font_h = Font(name="Aptos Narrow", size=9, bold=True)
+    font_b = Font(name="Aptos Narrow", size=9)
+    num_fmt = "#,##0; -#,##0"
 
-    # Родительские строки определяем по жирному шрифту в колонке A (8..last_data_row).
-    parent_rows: List[int] = []
-    for r in range(8, last_data_row + 1):
-        cell = ws.cell(row=r, column=1)
-        if cell.font and bool(cell.font.bold):
-            parent_rows.append(r)
+    for ws_name in obsh_sheetnames:
+        ws = wb[ws_name]
 
-    # Формулы: K, L, M, N, P (O пропускаем).
-    for r in range(8, last_data_row + 1):
-        _safe_set_value(r, 11, f"=G{r}-C{r}")  # K
-        _safe_set_value(r, 12, f"=H{r}-D{r}")  # L
-        _safe_set_value(r, 13, f"=L{r}-K{r}")  # M
-        _safe_set_value(r, 14, f"=IFERROR(INDEX('Счета каз'!B:B,MATCH(LEFT(A{r},4),'Счета каз'!A:A,0)),0)")  # N
-        _safe_set_value(r, 16, f"=IFERROR(INDEX('Счета каз'!C:C,MATCH(LEFT(A{r},4),'Счета каз'!A:A,0)),0)")  # P
+        last_row = _find_last_used_row_in_col_a(ws)
+        last_col = _find_last_used_col_in_header(ws)
+        start_row = last_row + 3
+        start_col = last_col + 2
 
-    # Визуальный стиль как в шаблоне (обычно Aptos Display 9).
-    base_font = Font(name="Aptos Display", size=9)
-    base_font_bold = Font(name="Aptos Display", size=9, bold=True)
-    right = Alignment(horizontal="right", vertical="center")
+        cols = _find_debit_credit_pairs(ws)
+        sheet_ref = _excel_sheet_ref(ws.title)
 
-    # Заголовок P7
-    _safe_set_value(7, 16, "ЧОК")
-    p7 = ws.cell(row=7, column=16)
-    if isinstance(p7, MergedCell):
-        tl = _merge_topleft(7, 16)
-        if tl:
-            p7 = ws.cell(row=tl[0], column=tl[1])
-    p7.font = base_font_bold
-    p7.alignment = right
+        # Заголовки таблицы
+        headers = ["Счет", "Полный", "ВГО", "Без ВГО"]
+        for j, h in enumerate(headers):
+            cell = ws.cell(row=start_row, column=start_col + j, value=h)
+            cell.font = font_h
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(left=dotted_gray, right=dotted_gray, top=dotted_gray, bottom=dotted_gray)
 
-    # Форматирование диапазонов
-    num_fmt = "#,##0"
+        # Строки (в таком порядке, как в ТЗ)
+        # Для каждой "строки счета": если счет найден — пишем полное название, иначе — 4 цифры.
+        # Для "итогов": CF/CFF/CFI/NWC/ЧП — считаем формулой по значениям выше.
+        row = start_row + 1
 
-    # K:M
-    for row in ws.iter_rows(min_row=8, max_row=last_data_row, min_col=11, max_col=13):
-        for cell in row:
-            if isinstance(cell, MergedCell):
-                continue
-            cell.font = base_font
-            cell.alignment = right
-            cell.number_format = num_fmt
+        def _write_line(label: str, full_text: str, full_formula: Optional[str]) -> int:
+            nonlocal row
+            ws.cell(row=row, column=start_col + 0, value=full_text).font = font_b
 
-    # N и P — шрифт + число + выравнивание (как в шаблоне)
-    for row in ws.iter_rows(min_row=8, max_row=last_data_row, min_col=14, max_col=14):
-        if not isinstance(row[0], MergedCell):
-            row[0].font = base_font
-            row[0].alignment = right
-            row[0].number_format = num_fmt
-    for row in ws.iter_rows(min_row=8, max_row=last_data_row, min_col=16, max_col=16):
-        if not isinstance(row[0], MergedCell):
-            row[0].font = base_font
-            row[0].alignment = right
-            row[0].number_format = num_fmt
+            c_full = ws.cell(row=row, column=start_col + 1, value=(full_formula or 0))
+            c_full.font = font_b
+            c_full.number_format = num_fmt
 
-    # Границы
-    def _side(color: str) -> Side:
-        return Side(style="thin", color=color)
+            ws.cell(row=row, column=start_col + 2, value="").font = font_b  # ВГО пустой
 
-    def _set_border(cell, left=None, right=None, top=None, bottom=None):
-        cell.border = Border(
-            left=_side(left) if left else None,
-            right=_side(right) if right else None,
-            top=_side(top) if top else None,
-            bottom=_side(bottom) if bottom else None,
-        )
+            c_no = ws.cell(row=row, column=start_col + 3, value=f"=({get_column_letter(start_col+1)}{row})-({get_column_letter(start_col+2)}{row})")
+            c_no.font = font_b
+            c_no.number_format = num_fmt
 
-    C_GREEN = "ACC8BD"
-    C_GRAY = "A0A0A0"
-    C_BLACK = "000000"
+            # Пунктирные границы вокруг строки
+            for j in range(4):
+                ws.cell(row=row, column=start_col + j).border = Border(left=dotted_gray, right=dotted_gray, top=dotted_gray, bottom=dotted_gray)
+            cur = row
+            row += 1
+            return cur
 
-    # K8:P(last_data_row) — внешние + внутренние линии
-    min_row, max_row = 8, last_data_row
-    min_col, max_col = 11, 16
-    for r in range(min_row, max_row + 1):
-        for c in range(min_col, max_col + 1):
-            cell = ws.cell(row=r, column=c)
-            left_col = C_GREEN if c == min_col else C_GREEN  # inside vertical тоже зеленая
-            right_col = C_GREEN if c == max_col else C_GREEN
-            top_col = C_GREEN if r == min_row else C_GREEN   # inside horizontal тоже зеленая
-            bottom_col = C_GREEN if r == max_row else C_GREEN
-            cell.border = Border(
-                left=_side(left_col),
-                right=_side(right_col),
-                top=_side(top_col),
-                bottom=_side(bottom_col),
-            )
+        def _write_sum_line(text: str, ref_rows: List[int]) -> int:
+            nonlocal row
+            ws.cell(row=row, column=start_col + 0, value=text).font = font_h
+            # Полный
+            letters = [f"{get_column_letter(start_col+1)}{r}" for r in ref_rows]
+            ws.cell(row=row, column=start_col + 1, value=("=SUM(" + ",".join(letters) + ")") if letters else 0).number_format = num_fmt
+            ws.cell(row=row, column=start_col + 1).font = font_h
+            # ВГО пустой
+            ws.cell(row=row, column=start_col + 2, value="").font = font_h
+            # Без ВГО
+            letters2 = [f"{get_column_letter(start_col+3)}{r}" for r in ref_rows]
+            ws.cell(row=row, column=start_col + 3, value=("=SUM(" + ",".join(letters2) + ")") if letters2 else 0).number_format = num_fmt
+            ws.cell(row=row, column=start_col + 3).font = font_h
+            for j in range(4):
+                ws.cell(row=row, column=start_col + j).border = Border(left=dotted_gray, right=dotted_gray, top=dotted_gray, bottom=dotted_gray)
+            cur = row
+            row += 1
+            return cur
 
-    # В шаблоне границы на K7:P7 и колонке J могут быть заданы через темы/условное форматирование.
-    # Здесь не навязываем эти линии, чтобы не "ломать" вид.
+        def _top_border(rr: int) -> None:
+            for j in range(4):
+                cell = ws.cell(row=rr, column=start_col + j)
+                cell.border = Border(
+                    left=cell.border.left,
+                    right=cell.border.right,
+                    top=thin_black,
+                    bottom=cell.border.bottom,
+                )
 
-    # Сводная таблица: через одну строку после "Итого" (одна пустая строка между ними)
-    ss = itogo_row + 2
-    labels = [
-        "ЧП", "Аморт", "Запасы", "Производство", "Налоги",
-        "незакр прибыль", "незакр расходы", "ФОТ", "Прочее",
-        "ДЗ", "Авансы выданные", "КЗ", "Авансы полученные", "прочее дз", "прочее кз",
-        "ОС", "Финвложения", "Капитал", "Лизинг", "Дивики", "Долг",
-        "CFO", "CFI", "CFF", "CF",
-    ]
-    bold_labels = {"ЧП", "CFO", "CFI", "CFF", "CF"}
-    cf_labels = {"CFO", "CFI", "CFF", "CF"}
+        # 1030
+        r1030 = _find_account_row(ws, "1030")
+        r_1030_line = _write_line("1030", _name_or_acc(ws, r1030, "1030"), _delta_formula(sheet_ref, r1030, cols) if r1030 else None)
+        r_cf = _write_sum_line("CF", [r_1030_line])
+        _top_border(r_cf)
 
-    row_of = {label: ss + i for i, label in enumerate(labels)}
+        row += 1  # пропуск строки
 
-    def _cfo_formula() -> str:
-        cats = [
-            "ЧП", "Аморт", "Запасы", "Производство", "Налоги",
-            "ФОТ", "Прочее", "ДЗ", "Авансы выданные", "КЗ",
-            "Авансы полученные", "прочее дз", "прочее кз",
-        ]
-        inner = ",".join(f"C{row_of[c]}" for c in cats)
-        return f"=SUM({inner})+C{row_of['незакр прибыль']}+C{row_of['незакр расходы']}"
+        # CFF: 3010 + 4010
+        r3010 = _find_account_row(ws, "3010")
+        r4010 = _find_account_row(ws, "4010")
+        r_3010_line = _write_line("3010", _name_or_acc(ws, r3010, "3010"), _delta_formula(sheet_ref, r3010, cols) if r3010 else None)
+        r_4010_line = _write_line("4010", _name_or_acc(ws, r4010, "4010"), _delta_formula(sheet_ref, r4010, cols) if r4010 else None)
+        r_cff = _write_sum_line("CFF", [r_3010_line, r_4010_line])
+        _top_border(r_cff)
 
-    cf_formulas = {
-        "CFO": _cfo_formula(),
-        "CFI": f"=C{row_of['ОС']}",
-        "CFF": f"=C{row_of['Финвложения']}+C{row_of['Долг']}+C{row_of['Дивики']}+C{row_of['Лизинг']}+C{row_of['Капитал']}",
-        "CF": f"=SUM(C{row_of['ЧП']}:C{row_of['Долг']})",
-    }
+        row += 1  # пропуск строки
 
-    num_fmt_cf = "#,##0;(#,##0);-"
-    # Сводная таблица в шаблоне также на Aptos Display 9
-    arial9_bold = base_font_bold
+        # CFI: 2410
+        r2410 = _find_account_row(ws, "2410")
+        r_2410_line = _write_line("2410", _name_or_acc(ws, r2410, "2410"), _delta_formula(sheet_ref, r2410, cols) if r2410 else None)
+        r_cfi = _write_sum_line("CFI", [r_2410_line])
+        _top_border(r_cfi)
 
-    for label in labels:
-        rr = row_of[label]
-        b = ws.cell(row=rr, column=2)  # B
-        c = ws.cell(row=rr, column=3)  # C
+        row += 1
 
-        _safe_set_value(rr, 2, label)
-        b = ws.cell(row=rr, column=2)
-        if isinstance(b, MergedCell):
-            tl = _merge_topleft(rr, 2)
-            if tl:
-                b = ws.cell(row=tl[0], column=tl[1])
-        b.font = base_font_bold if label in bold_labels else base_font
-        b.number_format = num_fmt_cf
+        # NWC: 1210,1310,1320,1330,1400,1710,3100,3310,3510
+        nwc_rows = []
+        for acc in ["1210", "1310", "1320", "1330", "1400", "1710", "3100", "3310", "3510"]:
+            rr = _find_account_row(ws, acc)
+            nwc_rows.append(_write_line(acc, _name_or_acc(ws, rr, acc), _delta_formula(sheet_ref, rr, cols) if rr else None))
+        r_nwc = _write_sum_line("NWC", nwc_rows)
+        _top_border(r_nwc)
 
-        if label in cf_labels:
-            _safe_set_value(rr, 3, cf_formulas[label])
-        else:
-            _safe_set_value(rr, 3, f"=+SUMIFS($M:$M,$N:$N,$B{rr})")
-        c = ws.cell(row=rr, column=3)
-        if isinstance(c, MergedCell):
-            tl = _merge_topleft(rr, 3)
-            if tl:
-                c = ws.cell(row=tl[0], column=tl[1])
-        c.font = arial9_bold
-        c.alignment = right
-        c.number_format = num_fmt_cf
+        row += 1
 
-    # Линии: под CFF и над CF (B:C)
-    r_cff = row_of["CFF"]
-    r_cf = row_of["CF"]
-    for col in (2, 3):
-        ws.cell(row=r_cff, column=col).border = Border(bottom=_side(C_BLACK))
-        ws.cell(row=r_cf, column=col).border = Border(top=_side(C_BLACK))
+        # Амортизация: 2420
+        r2420 = _find_account_row(ws, "2420")
+        r_am_line = _write_line("2420", _name_or_acc(ws, r2420, "2420"), _delta_formula(sheet_ref, r2420, cols) if r2420 else None)
 
-    # Высота строк: 12pt для 6..Итого
-    # Требование: весь лист с высотой строк 12pt.
-    try:
-        ws.sheet_format.defaultRowHeight = 12
-    except Exception:
-        pass
+        row += 1
 
-    # Если в файле есть явно заданные высоты строк — переопределяем их на 12.
-    for r in list(ws.row_dimensions.keys()):
-        ws.row_dimensions[r].height = 12
-
-    # Для типичных ОСВ размер листа небольшой, можно проставить высоту всем строкам до max_row.
-    # Но если max_row раздулся форматированием, не делаем дорогой цикл на десятки тысяч строк.
-    max_row = int(ws.max_row or 1)
-    if max_row <= 8000:
-        for r in range(1, max_row + 1):
-            ws.row_dimensions[r].height = 12
-
-    # Группировка/сворачивание: скрываем дочерние строки между "родителями"
-    try:
-        ws.sheet_format.outlineLevelRow = 1
-        ws.sheet_properties.outlinePr.summaryBelow = False
-    except Exception:
-        pass
-
-    for i, prow in enumerate(parent_rows):
-        child_start = prow + 1
-        child_end = (parent_rows[i + 1] if i + 1 < len(parent_rows) else itogo_row) - 1
-        if child_start <= child_end:
-            for rr in range(child_start, child_end + 1):
-                ws.row_dimensions[rr].outlineLevel = 1
-                ws.row_dimensions[rr].hidden = True
+        # ЧП = CF - CFF - CFI - NWC - Аморт
+        # Делается формулами по строкам итогов.
+        ws.cell(row=row, column=start_col + 0, value="ЧП").font = font_h
+        ws.cell(
+            row=row,
+            column=start_col + 1,
+            value=f"=({get_column_letter(start_col+1)}{r_cf})-({get_column_letter(start_col+1)}{r_cff})-({get_column_letter(start_col+1)}{r_cfi})-({get_column_letter(start_col+1)}{r_nwc})-({get_column_letter(start_col+1)}{r_am_line})",
+        ).font = font_h
+        ws.cell(row=row, column=start_col + 1).number_format = num_fmt
+        ws.cell(row=row, column=start_col + 2, value="").font = font_h
+        ws.cell(
+            row=row,
+            column=start_col + 3,
+            value=f"=({get_column_letter(start_col+3)}{r_cf})-({get_column_letter(start_col+3)}{r_cff})-({get_column_letter(start_col+3)}{r_cfi})-({get_column_letter(start_col+3)}{r_nwc})-({get_column_letter(start_col+3)}{r_am_line})",
+        ).font = font_h
+        ws.cell(row=row, column=start_col + 3).number_format = num_fmt
+        for j in range(4):
+            ws.cell(row=row, column=start_col + j).border = Border(left=dotted_gray, right=dotted_gray, top=thin_black, bottom=dotted_gray)
 
     out = io.BytesIO()
     wb.save(out)
@@ -3212,7 +3238,7 @@ if any(is_xls_filename(u.name) for u in uploads):
 sig = tuple(sorted((u.name, getattr(u, "size", None)) for u in uploads))
 if st.session_state.get("upload_sig") != sig:
     st.session_state["upload_sig"] = sig
-    for k in ["prepared_bytes", "prepared_name", "availability", "prep_report", "processed_bytes"]:
+    for k in ["prepared_bytes", "prepared_name", "availability", "prep_report", "processed_bytes", "obsh_meta"]:
         st.session_state.pop(k, None)
 
 cls = classify_uploads(uploads)
@@ -3440,15 +3466,46 @@ if "prepared_bytes" in st.session_state:
     inv_accounts_found = availability.get("inventory_accounts_found") or []
     saldo_ok = bool(availability.get("saldo_ok"))
     contracts_ok = bool(availability.get("contracts_ok"))
-    kaz_ok = bool(availability.get("kaz_ok"))
+    profit_ok = bool(availability.get("profit_ok"))
+    obsh_sheets = availability.get("obsh_sheets") or []
     insights_ok = bool(availability.get("insights_ok"))
     insights_existing = availability.get("insights_existing_titles") or []
     insights_missing = availability.get("insights_missing_titles") or []
     insights_legacy = availability.get("insights_legacy_titles") or []
 
-    opt_kaz_obsh = st.checkbox("Обработка общей ОСВ", value=False, disabled=(not kaz_ok))
-    if not kaz_ok:
-        st.caption("Обработка общей ОСВ недоступна: нужны листы «общ» и «Счета каз» в собранном файле.")
+    opt_profit = st.checkbox("Чистая прибыль", value=False, disabled=(not profit_ok))
+    if not profit_ok:
+        st.caption("Чистая прибыль недоступна: не найдены листы, содержащие «общ» в названии (например: «общ26», «Gобщ26»).")
+
+    selected_obsh: List[str] = []
+    if opt_profit and obsh_sheets:
+        # Показываем выбор листов "общ*" + подпись компании из A1
+        if "obsh_meta" not in st.session_state:
+            meta = {}
+            try:
+                wb_tmp = load_workbook(io.BytesIO(st.session_state["prepared_bytes"]), read_only=True, data_only=True)
+                for sh in obsh_sheets:
+                    try:
+                        a1 = wb_tmp[sh].cell(row=1, column=1).value
+                        meta[sh] = _short(a1) if a1 is not None else ""
+                    except Exception:
+                        meta[sh] = ""
+            except Exception:
+                meta = {sh: "" for sh in obsh_sheets}
+            st.session_state["obsh_meta"] = meta
+        meta = st.session_state.get("obsh_meta") or {}
+
+        st.caption("Выбери листы «общ*», по которым строить расчёт:")
+        for sh in obsh_sheets:
+            pad, col1, col2 = st.columns([1, 2, 4])
+            with pad:
+                st.write("")
+            with col1:
+                on = st.checkbox(sh, value=False, key=f"obsh_pick::{sh}")
+            with col2:
+                st.caption(meta.get(sh, ""))
+            if on:
+                selected_obsh.append(sh)
 
     opt_contracts = st.checkbox("Контракты", value=False, disabled=(not contracts_ok))
     if not contracts_ok:
@@ -3487,9 +3544,10 @@ if "prepared_bytes" in st.session_state:
     st.write("")
     st.markdown("#### Запуск")
 
-    has_any_mode = bool(selected_modes) or opt_inventory or opt_kaz_obsh or opt_insights
+    has_any_mode = bool(selected_modes) or opt_inventory or opt_profit or opt_insights
     inventory_ok = (not opt_inventory) or bool(inventory_accounts)
-    run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok)))
+    profit_sel_ok = (not opt_profit) or bool(selected_obsh)
+    run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok) or (not profit_sel_ok)))
 
     status_box = st.empty()
     progress = st.progress(0)
@@ -3502,10 +3560,10 @@ if "prepared_bytes" in st.session_state:
 
             out_bytes = st.session_state["prepared_bytes"]
 
-            if opt_kaz_obsh:
-                status_box.info("Обработка: Общая ОСВ…")
+            if opt_profit:
+                status_box.info("Обработка: Чистая прибыль…")
                 progress.progress(30)
-                out_bytes = run_code_4_obsh_kaz(out_bytes)
+                out_bytes = run_code_4_net_profit(out_bytes, selected_obsh)
                 progress.progress(40)
 
             if "Контракты" in selected_modes:
