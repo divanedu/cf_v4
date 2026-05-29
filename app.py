@@ -2945,7 +2945,10 @@ def run_code_4_net_profit(file_bytes: bytes, obsh_sheetnames: List[str]) -> byte
         for acc in ["1210", "1310", "1320", "1330", "1400", "1710", "3100", "3310", "3510"]:
             rr = _find_account_row(ws, acc)
             nwc_rows.append(_write_line(acc, _name_or_acc(ws, rr, acc), _delta_formula(sheet_ref, rr, cols) if rr else None))
+        # NWC в модели идёт со знаком "минус"
         r_nwc = _write_sum_line("NWC", nwc_rows)
+        ws.cell(row=r_nwc, column=start_col + 1).value = f"=-({ws.cell(row=r_nwc, column=start_col + 1).value[1:]})"
+        ws.cell(row=r_nwc, column=start_col + 3).value = f"=-({ws.cell(row=r_nwc, column=start_col + 3).value[1:]})"
         _top_border(r_nwc)
 
         row += 1
