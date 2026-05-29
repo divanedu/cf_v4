@@ -2837,12 +2837,12 @@ def run_code_4_net_profit(file_bytes: bytes, obsh_sheetnames: List[str]) -> byte
     for ws_name in obsh_sheetnames:
         ws = wb[ws_name]
 
-        last_row = _find_last_used_row_in_col_a(ws)
-        last_col = _find_last_used_col_in_header(ws)
-        start_row = last_row + 3
-        start_col = last_col + 2
-
         cols = _find_debit_credit_pairs(ws)
+        last_row = _find_last_used_row_in_col_a(ws)
+        start_row = last_row + 3
+        # Таблицу ставим на 2 столбца правее ПОСЛЕДНЕГО столбца "Сальдо на конец (Кредит)"
+        # (то есть правее третьей пары "Дебет/Кредит").
+        start_col = int(cols[5]) + 2
         sheet_ref = _excel_sheet_ref(ws.title)
 
         # Заголовки таблицы
@@ -2911,7 +2911,12 @@ def run_code_4_net_profit(file_bytes: bytes, obsh_sheetnames: List[str]) -> byte
 
         # 1030
         r1030 = _find_account_row(ws, "1030")
-        r_1030_line = _write_line("1030", _name_or_acc(ws, r1030, "1030"), _delta_formula(sheet_ref, r1030, cols) if r1030 else None)
+        if r1030:
+            base = _delta_formula(sheet_ref, r1030, cols)
+            neg = f"=-({base[1:]})" if isinstance(base, str) and base.startswith("=") else f"=-({base})"
+        else:
+            neg = None
+        r_1030_line = _write_line("1030", _name_or_acc(ws, r1030, "1030"), neg)
         r_cf = _write_sum_line("CF", [r_1030_line])
         _top_border(r_cf)
 
