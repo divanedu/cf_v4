@@ -2922,12 +2922,14 @@ def run_code_4_net_profit(file_bytes: bytes, obsh_sheetnames: List[str]) -> byte
 
         row += 1  # пропуск строки
 
-        # CFF: 3010 + 4010
+        # CFF: 3010 + 3030 + 4010
         r3010 = _find_account_row(ws, "3010")
+        r3030 = _find_account_row(ws, "3030")
         r4010 = _find_account_row(ws, "4010")
         r_3010_line = _write_line("3010", _name_or_acc(ws, r3010, "3010"), _delta_formula(sheet_ref, r3010, cols) if r3010 else None)
+        r_3030_line = _write_line("3030", _name_or_acc(ws, r3030, "3030"), _delta_formula(sheet_ref, r3030, cols) if r3030 else None)
         r_4010_line = _write_line("4010", _name_or_acc(ws, r4010, "4010"), _delta_formula(sheet_ref, r4010, cols) if r4010 else None)
-        r_cff = _write_sum_line("CFF", [r_3010_line, r_4010_line])
+        r_cff = _write_sum_line("CFF", [r_3010_line, r_3030_line, r_4010_line])
         _top_border(r_cff)
 
         row += 1  # пропуск строки
@@ -2940,9 +2942,9 @@ def run_code_4_net_profit(file_bytes: bytes, obsh_sheetnames: List[str]) -> byte
 
         row += 1
 
-        # NWC: 1210,1310,1320,1330,1400,1710,3100,3310,3510
+        # NWC: 1210,1310,1320,1330,1400,1710,1711,3100,3310,3311,3320,3350,3510
         nwc_rows = []
-        for acc in ["1210", "1310", "1320", "1330", "1400", "1710", "3100", "3310", "3510"]:
+        for acc in ["1210", "1310", "1320", "1330", "1400", "1710", "1711", "3100", "3310", "3311", "3320", "3350", "3510"]:
             rr = _find_account_row(ws, acc)
             nwc_rows.append(_write_line(acc, _name_or_acc(ws, rr, acc), _delta_formula(sheet_ref, rr, cols) if rr else None))
         r_nwc = _write_sum_line("NWC", nwc_rows)
