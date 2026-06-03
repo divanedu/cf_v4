@@ -2,3 +2,5 @@ streamlit==1.52.2
 pandas
 openpyxl
 pywin32; sys_platform == "win32"
+requests
+beautifulsoup4
