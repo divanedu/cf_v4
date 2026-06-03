@@ -1089,6 +1089,25 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
     gos_sheets = [sh for sh in wb.sheetnames if "гос" in str(sh).lower()]
     gos_ok = bool(gos_sheets)
 
+    # Объединение ОСВ по группе: «*общ*» листы с ≥2 разными префиксами на один суффикс
+    _grp_by_suffix: Dict[str, List[str]] = {}
+    for sh in wb.sheetnames:
+        sh_lower = sh.lower()
+        idx = sh_lower.find("общ")
+        if idx < 0:
+            continue
+        suffix = sh[idx + 3:]  # всё после «общ»
+        _grp_by_suffix.setdefault(suffix, []).append(sh)
+
+    valid_group_osv: Dict[str, List[str]] = {}
+    for suf, sheets in _grp_by_suffix.items():
+        # Проверяем, что у нас ≥2 разных префиксов
+        prefixes = set(sh[:sh.lower().find("общ")] for sh in sheets)
+        if len(prefixes) >= 2:
+            valid_group_osv[suf] = sheets
+
+    group_osv_ok = bool(valid_group_osv)
+
     return {
         "inventory_accounts_found": inventory_accounts_found,
         "saldo_ok": saldo_ok,
@@ -1103,6 +1122,8 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
         "insights_legacy_titles": insights_legacy_titles,
         "gos_ok": gos_ok,
         "gos_sheets": gos_sheets,
+        "group_osv_ok": group_osv_ok,
+        "valid_group_osv": valid_group_osv,
     }
 
 
@@ -1526,12 +1547,12 @@ def run_code_1(file_bytes: bytes) -> bytes:
         ws2 = wb.create_sheet(out2_name, insert_index) if insert_index is not None else wb.create_sheet(out2_name)
 
         ws2["A1"] = "Все значения указаны в тысячах тенге"
-        ws2["A1"].font = Font(name="Aptos Narrow", size=9, bold=True)
+        ws2["A1"].font = Font(name="Arial", size=9, bold=True)
 
         # На "сальд" везде используем Aptos Narrow 9.
-        font_h = Font(name="Aptos Narrow", size=9, bold=True)
-        font_b = Font(name="Aptos Narrow", size=9)
-        font_bb = Font(name="Aptos Narrow", size=9, bold=True)
+        font_h = Font(name="Arial", size=9, bold=True)
+        font_b = Font(name="Arial", size=9)
+        font_bb = Font(name="Arial", size=9, bold=True)
         align_c = Alignment(horizontal="center")
         align_l = Alignment(horizontal="left")
         num_fmt = "#,##0;[Red](#,##0)"
@@ -1577,7 +1598,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
         # Визуальные разделители: "ЗАКАЗЧИКИ" (до колонок L/M, не залезаем на блок месяцев)
         sec_fill = PatternFill(fill_type="solid", fgColor="1F2937")
-        sec_font = Font(name="Aptos Narrow", size=9, bold=True, color="FFFFFF")
+        sec_font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
         for col in range(2, last_used_col + 1):  # B..(конец таблицы)
             c = ws2.cell(row=1, column=col)
             c.fill = sec_fill
@@ -2629,7 +2650,7 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
         cols = ["K", "L", "M", "N", "O", "P", "Q", "R"]
 
         fill_hdr = PatternFill(fill_type="solid", fgColor="E4F0DD")
-        font_hdr = Font(name="Aptos Narrow", size=9, bold=True, color="003F2F")
+        font_hdr = Font(name="Arial", size=9, bold=True, color="003F2F")
         align_hdr = Alignment(horizontal="center", vertical="top", wrap_text=True)
         thin = Side(border_style="thin", color="000000")
         border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -2643,7 +2664,7 @@ def run_code_3_inventory(file_bytes: bytes, accounts: List[str]) -> Tuple[bytes,
             c.border = border
             c.number_format = "#,##0.00"
 
-        font_sum = Font(name="Aptos Narrow", size=9, bold=True)
+        font_sum = Font(name="Arial", size=9, bold=True)
         align_sum = Alignment(horizontal="center")
         for col in cols:
             c = ws[f"{col}7"]
@@ -2839,8 +2860,8 @@ def run_code_4_net_profit(file_bytes: bytes, obsh_sheetnames: List[str]) -> byte
     thin_black = Side(style="thin", color="000000")
     dotted_gray = Side(style="dotted", color="A0A0A0")
     header_fill = PatternFill("solid", fgColor="EDEDED")
-    font_h = Font(name="Aptos Narrow", size=9, bold=True)
-    font_b = Font(name="Aptos Narrow", size=9)
+    font_h = Font(name="Arial", size=9, bold=True)
+    font_b = Font(name="Arial", size=9)
     num_fmt = "#,##0; -#,##0"
 
     for ws_name in obsh_sheetnames:
@@ -3407,6 +3428,347 @@ def run_code_6_gos(file_bytes: bytes, selected_gos_sheets: List[str], token: str
 
 
 # =========================
+# CODE 7 (Объединить общие ОСВ по группе)
+# Находит листы «*общ*» (с префиксами и суффиксами),
+# группирует по суффиксу (году), создаёт лист GroupXX с объединёнными данными.
+# =========================
+
+_GSC_SEC_WIDTH = 8  # account (1) + data (6) + separator (1)
+
+
+def _gsc_excel_sheetref(name: str) -> str:
+    """Возвращает ссылку на лист в формуле Excel (с кавычками если нужно)."""
+    if re.search(r"[ \t!'\[\]\*\?:~\(\)]", name) or (name and name[0].isdigit()):
+        return "'" + name.replace("'", "''") + "'"
+    return name
+
+
+def _gsc_parse_osv_data_cols(ws) -> Dict[str, int]:
+    """Определяет номера столбцов для 6 полей данных в листе ОСВ."""
+    saldo_nach_col = oborot_col = saldo_kon_col = None
+    header_row_idx = None
+
+    for row_cells in ws.iter_rows(min_row=1, max_row=20):
+        for cell in row_cells:
+            if isinstance(cell, MergedCell):
+                continue
+            v = str(cell.value or "").strip().lower()
+            if "сальдо на начало" in v and saldo_nach_col is None:
+                saldo_nach_col = cell.column
+                header_row_idx = cell.row
+            if "обороты за период" in v and oborot_col is None:
+                oborot_col = cell.column
+            if "сальдо на конец" in v and saldo_kon_col is None:
+                saldo_kon_col = cell.column
+
+    if saldo_nach_col is None:
+        saldo_nach_col = 3
+    if oborot_col is None:
+        oborot_col = 5
+    if saldo_kon_col is None:
+        saldo_kon_col = 7
+
+    # Ищем строку с «Дебет»/«Кредит» ниже заголовков
+    deb_kred_map: Dict[int, str] = {}
+    search_from = header_row_idx if header_row_idx else 1
+    for row_cells in ws.iter_rows(min_row=search_from, max_row=search_from + 4):
+        for cell in row_cells:
+            if isinstance(cell, MergedCell):
+                continue
+            v = str(cell.value or "").strip().lower()
+            if v == "дебет":
+                deb_kred_map[cell.column] = "дебет"
+            elif v == "кредит":
+                deb_kred_map[cell.column] = "кредит"
+        if deb_kred_map:
+            break
+
+    def find_pair(g_col: int):
+        cols_at = sorted(c for c in deb_kred_map if c >= g_col)
+        deb = next((c for c in cols_at if deb_kred_map[c] == "дебет"), g_col)
+        kred = next((c for c in cols_at if deb_kred_map[c] == "кредит" and c > deb), deb + 1)
+        return deb, kred
+
+    if deb_kred_map:
+        d1, k1 = find_pair(saldo_nach_col)
+        d2, k2 = find_pair(oborot_col)
+        d3, k3 = find_pair(saldo_kon_col)
+    else:
+        d1, k1 = saldo_nach_col, saldo_nach_col + 1
+        d2, k2 = oborot_col, oborot_col + 1
+        d3, k3 = saldo_kon_col, saldo_kon_col + 1
+
+    return {
+        "saldo_nach_deb": d1, "saldo_nach_kred": k1,
+        "oborot_deb": d2, "oborot_kred": k2,
+        "saldo_kon_deb": d3, "saldo_kon_kred": k3,
+    }
+
+
+_GSC_FIELD_KEYS = [
+    "saldo_nach_deb", "saldo_nach_kred",
+    "oborot_deb", "oborot_kred",
+    "saldo_kon_deb", "saldo_kon_kred",
+]
+
+
+def run_code_7_group_osv(file_bytes: bytes, selected_groups: Dict[str, List[str]]) -> bytes:
+    """
+    selected_groups: {suffix: [sheet_names]} — например {"25": ["Uобщ25", "Тобщ25"]}
+    """
+    wb = load_workbook(io.BytesIO(file_bytes))
+
+    # ── стили ──────────────────────────────────────────────────────────
+    # #,##0 → Excel применяет разделитель тысяч для ВСЕХ групп по локали (пробел в RU/KZ)
+    # третья секция пустая → ноль отображается как пустая ячейка, значение остаётся 0
+    NUM_FMT = "#,##0_ ;[Red]-#,##0 ;"
+
+    # шрифты
+    F       = Font(name="Arial", size=8)
+    F_BOLD  = Font(name="Arial", size=8, bold=True)
+    F_HDR   = Font(name="Arial", size=8, bold=True, color="FFFFFF")
+
+    # заливки
+    FILL_H1     = PatternFill("solid", fgColor="17375E")  # строка 1 (тёмный синий)
+    FILL_H2     = PatternFill("solid", fgColor="2E74B5")  # строка 2 (средний синий)
+    FILL_GRP    = PatternFill("solid", fgColor="DEEAF1")  # группа (светло-голубой)
+    FILL_CO_ODD = PatternFill("solid", fgColor="F2F7FC")  # нечётные компании
+    FILL_ITOGO  = PatternFill("solid", fgColor="D9E1F2")  # итого
+    FILL_SEP    = PatternFill("solid", fgColor="D4DCE8")  # разделитель
+    FILL_NONE   = PatternFill(fill_type=None)
+
+    # стороны границ
+    _T = Side(style="thin",   color="D9D9D9")
+    _M = Side(style="medium", color="2E74B5")
+    _N = Side(style=None)
+
+    def _border(left=_T, right=_T, top=_T, bottom=_T):
+        return Border(left=left, right=right, top=top, bottom=bottom)
+
+    # выравнивание
+    AL_C  = Alignment(horizontal="center",  vertical="center", wrap_text=True)
+    AL_L  = Alignment(horizontal="left",    vertical="center", wrap_text=True)
+    AL_R  = Alignment(horizontal="right",   vertical="center")
+    AL_SEP = Alignment()
+
+    insert_pos = 0
+    for suffix in sorted(selected_groups.keys()):
+        source_sheets = selected_groups[suffix]
+        valid_sheets = [s for s in source_sheets if s in wb.sheetnames]
+        if len(valid_sheets) < 2:
+            continue
+
+        # ── читаем данные исходных ОСВ ─────────────────────────────────
+        companies: List[Dict[str, Any]] = []
+        for sh in valid_sheets:
+            ws_src = wb[sh]
+            company_name = str(ws_src.cell(1, 1).value or sh).strip()
+            period = str(ws_src.cell(2, 1).value or "").strip()
+            data_cols = _gsc_parse_osv_data_cols(ws_src)
+            accounts: List[str] = []
+            for row_cells in ws_src.iter_rows(min_col=1, max_col=1):
+                val = str(row_cells[0].value or "").strip()
+                if re.match(r"^\d{4}", val):
+                    accounts.append(val)
+            companies.append({
+                "sheet_name": sh, "company_name": company_name,
+                "period": period, "data_cols": data_cols, "accounts": accounts,
+            })
+
+        if not companies:
+            continue
+
+        # ── объединяем счета ────────────────────────────────────────────
+        seen: Set[str] = set()
+        all_accounts: List[str] = []
+        for cd in companies:
+            for acc in cd["accounts"]:
+                if acc not in seen:
+                    seen.add(acc)
+                    all_accounts.append(acc)
+
+        def _sort_key(s: str):
+            m = re.match(r"^(\d{4})", s)
+            return (int(m.group(1)) if m else 99999, s)
+
+        all_accounts.sort(key=_sort_key)
+
+        # XX00 счета → жирные (код оканчивается на 00)
+        round_set: Set[str] = set()
+        for acc in all_accounts:
+            m = re.match(r"^(\d{4})", acc)
+            if m and m.group(1)[2:] == "00":
+                round_set.add(acc)
+
+        # ── создаём лист ────────────────────────────────────────────────
+        group_title = f"Group{suffix}" if suffix else "Group"
+        group_title = make_unique_sheet_title(wb, group_title)
+        ws_g = wb.create_sheet(group_title, insert_pos)
+        insert_pos += 1
+        n = len(companies)
+
+        # вспомогательные функции адресации
+        def sec_start(k: int) -> int:        return 1 + k * _GSC_SEC_WIDTH
+        def sec_acc_col(k: int) -> int:      return sec_start(k)
+        def sec_data_col(k: int, o: int) -> int: return sec_start(k) + 1 + o
+
+        def sumifs(src_sh: str, src_col: int, lkp_col: int, row: int) -> str:
+            sr  = _gsc_excel_sheetref(src_sh)
+            gr  = _gsc_excel_sheetref(group_title)
+            scl = get_column_letter(src_col)
+            lcl = get_column_letter(lkp_col)
+            return f"=SUMIFS({sr}!{scl}:{scl},{sr}!$A:$A,{gr}!${lcl}{row})"
+
+        DATA_ROW_START = 3
+        itogo_row      = DATA_ROW_START + len(all_accounts)
+        # количество колонок: (n+1) секций, последняя без разделителя
+        total_cols     = n * _GSC_SEC_WIDTH + 7
+
+        # ── пишем контент ───────────────────────────────────────────────
+
+        # строка 1
+        group_header = " + ".join(cd["company_name"] for cd in companies)
+        ws_g.cell(1, sec_acc_col(0), group_header)
+        ws_g.cell(1, sec_data_col(0, 0), "Сальдо на начало")
+        ws_g.cell(1, sec_data_col(0, 2), "Обороты за период")
+        ws_g.cell(1, sec_data_col(0, 4), "Сальдо на конец")
+        for k, cd in enumerate(companies, 1):
+            ws_g.cell(1, sec_acc_col(k), cd["sheet_name"])
+            ws_g.cell(1, sec_data_col(k, 0), "Сальдо на начало")
+            ws_g.cell(1, sec_data_col(k, 2), "Обороты за период")
+            ws_g.cell(1, sec_data_col(k, 4), "Сальдо на конец")
+
+        # строка 2
+        ws_g.cell(2, sec_acc_col(0), companies[0]["period"])
+        for k in range(n + 1):
+            for o, lbl in enumerate(["Дебет", "Кредит", "Дебет", "Кредит", "Дебет", "Кредит"]):
+                ws_g.cell(2, sec_data_col(k, o), lbl)
+
+        # строки счетов
+        for i, acc in enumerate(all_accounts):
+            r = DATA_ROW_START + i
+            ws_g.cell(r, sec_acc_col(0), acc)
+            for o in range(6):
+                parts = [get_column_letter(sec_data_col(k, o)) + str(r) for k in range(1, n + 1)]
+                ws_g.cell(r, sec_data_col(0, o), "=" + "+".join(parts))
+            for k, cd in enumerate(companies, 1):
+                ws_g.cell(r, sec_acc_col(k), acc)
+                for o, fkey in enumerate(_GSC_FIELD_KEYS):
+                    src_col = cd["data_cols"].get(fkey)
+                    if src_col:
+                        ws_g.cell(r, sec_data_col(k, o), sumifs(cd["sheet_name"], src_col, sec_acc_col(k), r))
+
+        # итого
+        ws_g.cell(itogo_row, sec_acc_col(0), "Итого")
+        for o in range(6):
+            parts = [get_column_letter(sec_data_col(k, o)) + str(itogo_row) for k in range(1, n + 1)]
+            ws_g.cell(itogo_row, sec_data_col(0, o), "=" + "+".join(parts))
+        for k, cd in enumerate(companies, 1):
+            ws_g.cell(itogo_row, sec_acc_col(k), "Итого")
+            for o, fkey in enumerate(_GSC_FIELD_KEYS):
+                src_col = cd["data_cols"].get(fkey)
+                if src_col:
+                    ws_g.cell(itogo_row, sec_data_col(k, o), sumifs(cd["sheet_name"], src_col, sec_acc_col(k), itogo_row))
+
+        # ── объединение ячеек заголовка ─────────────────────────────────
+        for k in range(n + 1):
+            # аккаунт-ячейка: строки 1-2 не объединяем, только ставим wrap
+            ws_g.merge_cells(
+                start_row=1, start_column=sec_data_col(k, 0),
+                end_row=1,   end_column=sec_data_col(k, 1))
+            ws_g.merge_cells(
+                start_row=1, start_column=sec_data_col(k, 2),
+                end_row=1,   end_column=sec_data_col(k, 3))
+            ws_g.merge_cells(
+                start_row=1, start_column=sec_data_col(k, 4),
+                end_row=1,   end_column=sec_data_col(k, 5))
+
+        # ── применяем дизайн ко всем ячейкам ───────────────────────────
+        for r in range(1, itogo_row + 1):
+            for c in range(1, total_cols + 1):
+                cell = ws_g.cell(r, c)
+                sec_idx = (c - 1) // _GSC_SEC_WIDTH
+                offset  = (c - 1) %  _GSC_SEC_WIDTH
+                is_sep  = offset == 7
+                is_acc  = offset == 0
+                is_data = not is_sep and not is_acc
+
+                # шрифт
+                if is_sep:
+                    cell.font = F
+                elif r <= 2:
+                    cell.font = F_HDR
+                elif r == itogo_row or (is_acc and str(cell.value or "") in round_set):
+                    cell.font = F_BOLD
+                else:
+                    cell.font = F
+
+                # заливка
+                if r == 1:
+                    cell.fill = FILL_H1
+                elif r == 2:
+                    cell.fill = FILL_H2
+                elif is_sep:
+                    cell.fill = FILL_SEP
+                elif r == itogo_row:
+                    cell.fill = FILL_ITOGO
+                elif sec_idx == 0:
+                    cell.fill = FILL_GRP
+                elif sec_idx % 2 == 0:
+                    cell.fill = FILL_CO_ODD
+                else:
+                    cell.fill = FILL_NONE
+
+                # формат чисел
+                if r >= DATA_ROW_START and is_data:
+                    cell.number_format = NUM_FMT
+
+                # выравнивание
+                if is_sep:
+                    cell.alignment = AL_SEP
+                elif r <= 2:
+                    cell.alignment = AL_C
+                elif is_acc:
+                    cell.alignment = AL_L
+                else:
+                    cell.alignment = AL_R
+
+                # границы
+                if is_sep:
+                    cell.border = Border()
+                else:
+                    right_side = _M if offset == 6 else _T
+                    top_side   = _M if r == itogo_row or r == DATA_ROW_START else _T
+                    bot_side   = _M if r == 2 else _T
+                    cell.border = _border(right=right_side, top=top_side, bottom=bot_side)
+
+        # ── ширины колонок и высоты строк ──────────────────────────────
+        for c in range(1, total_cols + 1):
+            offset = (c - 1) % _GSC_SEC_WIDTH
+            ltr    = get_column_letter(c)
+            if offset == 7:
+                ws_g.column_dimensions[ltr].width = 0.6
+            elif offset == 0:
+                ws_g.column_dimensions[ltr].width = 30
+            else:
+                ws_g.column_dimensions[ltr].width = 11.5
+
+        ws_g.row_dimensions[1].height = 30
+        ws_g.row_dimensions[2].height = 22
+        for r in range(DATA_ROW_START, itogo_row):
+            ws_g.row_dimensions[r].height = 13
+        ws_g.row_dimensions[itogo_row].height = 16
+
+        # ── заморозка ───────────────────────────────────────────────────
+        ws_g.freeze_panes = "B3"
+
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# =========================
 # ?????? ? ????
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
@@ -3432,8 +3794,6 @@ st.markdown(
       footer {{visibility: hidden;}}
       header {{visibility: hidden;}}
 
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap');
       @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&display=swap');
 
       .stApp {{
@@ -3442,17 +3802,17 @@ st.markdown(
       }}
 
       html, body, [class*="css"], .stApp {{
-        font-size: 15px !important;
-        font-family: "Playfair Display", Georgia, "Times New Roman", serif !important;
+        font-size: 14px !important;
+        font-family: "Consolas", "Courier New", monospace !important;
       }}
 
-      /* Streamlit/BaseWeb часто задают шрифты точечно — фиксируем на всей типографике. */
+      /* Фиксируем Consolas по всей типографике Streamlit/BaseWeb. */
       button, input, textarea, select, option,
       label,
       [data-baseweb],
       [data-baseweb] *,
       [data-testid] * {{
-        font-family: "Playfair Display", Georgia, "Times New Roman", serif !important;
+        font-family: "Consolas", "Courier New", monospace !important;
       }}
 
       .block-container {{
@@ -3467,6 +3827,7 @@ st.markdown(
         color: {TEXT} !important;
         font-weight: 700 !important;
         letter-spacing: 0.2px !important;
+        font-family: "Playfair Display", Georgia, serif !important;
       }}
 
       /* Карточки/контейнеры */
@@ -3890,6 +4251,8 @@ if "prepared_bytes" in st.session_state:
     insights_legacy = availability.get("insights_legacy_titles") or []
     gos_ok = bool(availability.get("gos_ok"))
     gos_sheets = availability.get("gos_sheets") or []
+    group_osv_ok = bool(availability.get("group_osv_ok"))
+    valid_group_osv: Dict[str, List[str]] = availability.get("valid_group_osv") or {}
 
     opt_profit = st.checkbox("Чистая прибыль", value=False, disabled=(not profit_ok))
     if not profit_ok:
@@ -3977,6 +4340,24 @@ if "prepared_bytes" in st.session_state:
             key="gos_token_input",
         )
 
+    opt_group_osv = st.checkbox("Объединить общие ОСВ по группе", value=False, disabled=(not group_osv_ok))
+    if not group_osv_ok:
+        st.caption("Недоступно: не найдены листы «*общ*» с одинаковым суффиксом и ≥2 разными префиксами.")
+
+    selected_groups: Dict[str, List[str]] = {}
+    if opt_group_osv and valid_group_osv:
+        st.caption("Выбери группы для объединения:")
+        for suf in sorted(valid_group_osv.keys()):
+            sheets_in_group = valid_group_osv[suf]
+            label_name = f"Group{suf}" if suf else "Group"
+            label = f"{label_name} — {', '.join(sheets_in_group)}"
+            pad, col1 = st.columns([1, 6])
+            with pad:
+                st.write("")
+            with col1:
+                if st.checkbox(label, value=False, key=f"grp_pick::{suf}"):
+                    selected_groups[suf] = sheets_in_group
+
     selected_modes: List[str] = []
     if opt_saldo:
         selected_modes.append("Сальдо")
@@ -3986,11 +4367,12 @@ if "prepared_bytes" in st.session_state:
     st.write("")
     st.markdown("#### Запуск")
 
-    has_any_mode = bool(selected_modes) or opt_inventory or opt_profit or opt_insights or opt_gos
+    has_any_mode = bool(selected_modes) or opt_inventory or opt_profit or opt_insights or opt_gos or (opt_group_osv and bool(selected_groups))
     inventory_ok = (not opt_inventory) or bool(inventory_accounts)
     profit_sel_ok = (not opt_profit) or bool(selected_obsh)
     gos_sel_ok = (not opt_gos) or (bool(selected_gos_sheets) and bool(gos_token))
-    run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok) or (not profit_sel_ok) or (not gos_sel_ok)))
+    group_osv_sel_ok = (not opt_group_osv) or bool(selected_groups)
+    run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok) or (not profit_sel_ok) or (not gos_sel_ok) or (not group_osv_sel_ok)))
 
     status_box = st.empty()
     progress = st.progress(0)
@@ -4044,6 +4426,11 @@ if "prepared_bytes" in st.session_state:
                 status_box.info("Обработка: Госы (запросы к API, может занять время)…")
                 progress.progress(99)
                 out_bytes = run_code_6_gos(out_bytes, selected_gos_sheets, gos_token)
+
+            if opt_group_osv and selected_groups:
+                status_box.info("Обработка: объединение ОСВ по группе…")
+                progress.progress(99)
+                out_bytes = run_code_7_group_osv(out_bytes, selected_groups)
 
             st.session_state["processed_bytes"] = out_bytes
             st.session_state["processed_name"] = st.session_state.get("prepared_name") or "output.xlsx"
