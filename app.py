@@ -6,7 +6,10 @@ import tempfile
 import zipfile
 from copy import copy as _copy
 from collections import defaultdict
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+import requests as _requests_lib
 
 import pandas as pd
 import streamlit as st
@@ -1082,6 +1085,10 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
 
     insights_ok = bool(insights_missing_titles) or bool(insights_legacy_titles)
 
+    # Госы: листы, содержащие "гос" в названии (без учёта регистра)
+    gos_sheets = [sh for sh in wb.sheetnames if "гос" in str(sh).lower()]
+    gos_ok = bool(gos_sheets)
+
     return {
         "inventory_accounts_found": inventory_accounts_found,
         "saldo_ok": saldo_ok,
@@ -1094,6 +1101,8 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
         "insights_existing_titles": insights_existing_titles,
         "insights_missing_titles": insights_missing_titles,
         "insights_legacy_titles": insights_legacy_titles,
+        "gos_ok": gos_ok,
+        "gos_sheets": gos_sheets,
     }
 
 
@@ -2998,6 +3007,406 @@ def run_code_5_insights(file_bytes: bytes) -> bytes:
 
 
 # =========================
+# CODE 6 (Госы)
+# Для каждого выбранного листа «гос*»:
+#   - находит столбцы «Номер договора» и «Статус» в строке 1
+#   - по каждой строке со статусом «Действует» запрашивает данные из API goszakup
+#   - записывает результат правее существующей таблицы
+# =========================
+
+_GOS_BASE_OWS = "https://ows.goszakup.gov.kz"
+_GOS_BASE_WEB = "https://www.goszakup.gov.kz"
+
+_GOS_NEW_COLS = [
+    "Ссылка",
+    "Многолетний",
+    "Год окончания",
+    "Сумма 2026",
+    "Сумма 2027",
+    "% аванса",
+    "Сумма аванса",
+    "Обеспечение аванса требуется",
+    "Обеспечение аванса прикреплено",
+    "Факт сумма",
+]
+
+
+def _gos_money(x) -> float:
+    if x in [None, "", "null"]:
+        return 0.0
+    try:
+        return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except Exception:
+        return 0.0
+
+
+def _gos_parse_money(text: str) -> float:
+    if text is None:
+        return 0.0
+    text = str(text).replace("\xa0", " ").replace(" ", "").replace(",", ".")
+    text = re.sub(r"[^\d.]", "", text)
+    return _gos_money(text) if text else 0.0
+
+
+def _gos_clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n+", "\n", text)
+    return text.strip()
+
+
+def _gos_html_to_text(html: str) -> str:
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        return _gos_clean_text(soup.get_text("\n", strip=True))
+    except Exception:
+        text = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", "\n", text)
+        return _gos_clean_text(text)
+
+
+def _gos_get_year_from_date(date_str):
+    if not date_str:
+        return None
+    try:
+        return int(str(date_str)[:4])
+    except Exception:
+        return None
+
+
+def _gos_get_max_end_year(contract: Dict[str, Any]) -> Optional[int]:
+    years = []
+    for field in ["contract_end_date", "plan_exec_date", "ec_end_date"]:
+        y = _gos_get_year_from_date(contract.get(field))
+        if y:
+            years.append(y)
+    return max(years) if years else None
+
+
+def _gos_get_additions_url(contract: Dict[str, Any]) -> str:
+    additions_id = contract.get("root_id") or contract.get("id")
+    if not additions_id:
+        return ""
+    return f"{_GOS_BASE_WEB}/ru/egzcontract/cpublic/additions/{additions_id}"
+
+
+def _gos_get_json(url: str, token: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+    r = _requests_lib.get(url, headers=headers, params=params, timeout=40)
+    if r.status_code == 401:
+        raise Exception("401: неверный или просроченный токен")
+    if r.status_code == 403:
+        raise Exception(f"403: нет доступа к API: {url}")
+    if r.status_code == 404:
+        raise Exception(f"404: не найдено: {url}")
+    r.raise_for_status()
+    return r.json()
+
+
+def _gos_get_html_text(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    r = _requests_lib.get(url, headers=headers, timeout=40)
+    r.raise_for_status()
+    return _gos_html_to_text(r.text)
+
+
+def _gos_unwrap_contract(data: Any) -> Dict[str, Any]:
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+    if isinstance(data, list):
+        if not data:
+            raise Exception("Договор не найден")
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    raise Exception(f"Неожиданный формат ответа: {type(data)}")
+
+
+def _gos_get_contract_by_number(contract_number: str, token: str) -> Dict[str, Any]:
+    if "/" in contract_number:
+        url = f"{_GOS_BASE_OWS}/v3/contract/number-sys/"
+    else:
+        url = f"{_GOS_BASE_OWS}/v3/contract/number/"
+    data = _gos_get_json(url, token, params={"number": contract_number})
+    return _gos_unwrap_contract(data)
+
+
+def _gos_get_contract_units(contract_id: int, token: str) -> Dict[str, Any]:
+    url = f"{_GOS_BASE_OWS}/v3/contract/{contract_id}/units"
+    return _gos_get_json(url, token)
+
+
+def _gos_get_plan_point(pln_point_id: int, token: str) -> Optional[Dict[str, Any]]:
+    url = f"{_GOS_BASE_OWS}/v3/plans/view/{pln_point_id}"
+    try:
+        data = _gos_get_json(url, token)
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        return data
+    except Exception:
+        return None
+
+
+def _gos_extract_current_block(additions_text: str, contract_number: str) -> str:
+    start_pattern = re.escape(contract_number) + r"\s+Статус договора:"
+    start_match = re.search(start_pattern, additions_text)
+    if not start_match:
+        return additions_text
+    start = start_match.start()
+    next_match = re.search(r"\n\d{12}/\d{6}/\d{2}\s+Статус договора:", additions_text[start_match.end():])
+    if next_match:
+        return additions_text[start: start_match.end() + next_match.start()]
+    footer_patterns = ["АИИС ЭГЗ", "Техническая поддержка", "Чем я могу Вам помочь"]
+    end = len(additions_text)
+    for p in footer_patterns:
+        m = re.search(p, additions_text[start:])
+        if m:
+            end = min(end, start + m.start())
+    return additions_text[start:end]
+
+
+def _gos_parse_year_amounts(block: str) -> Dict[str, float]:
+    result: Dict[str, float] = {}
+    pattern = r"Сумма\s+на\s+(\d{4})\s+год\s*[-:]\s*([\d\s]+(?:[.,]\d+)?)"
+    for year, amount in re.findall(pattern, block, flags=re.I):
+        result[year] = result.get(year, 0.0) + _gos_parse_money(amount)
+    return {k: _gos_money(v) for k, v in result.items()}
+
+
+def _gos_parse_advance_security(block: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"advance_security_required": None, "advance_security_attached": None}
+    pattern = (
+        r"Обеспечение исполнения договора на сумму аванса по договору\s*"
+        r"Требуется:\s*(Да|Нет)\s*,\s*Прикреплен:\s*(Да|Нет)"
+    )
+    m = re.search(pattern, block, flags=re.I)
+    if m:
+        result["advance_security_required"] = 1 if m.group(1).lower() == "да" else 0
+        result["advance_security_attached"] = 1 if m.group(2).lower() == "да" else 0
+    return result
+
+
+def _gos_parse_totals(block: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"contract_sum": None, "fact_sum": None}
+    m = re.search(r"Общая итоговая сумма договора\s*:\s*([\d\s]+(?:[.,]\d+)?)", block, flags=re.I)
+    if m:
+        result["contract_sum"] = _gos_parse_money(m.group(1))
+    m = re.search(r"Общая фактическая сумма договора\s*:\s*([\d\s]+(?:[.,]\d+)?)", block, flags=re.I)
+    if m:
+        result["fact_sum"] = _gos_parse_money(m.group(1))
+    return result
+
+
+def _gos_extract_advance_percent(contract: Dict[str, Any], token: str) -> Dict[str, Any]:
+    advance_percent = 0.0
+    unresolved: List[int] = []
+    units = contract.get("units", {}).get("items", []) or []
+    for unit in units:
+        pln_point_id = unit.get("pln_point_id")
+        if not pln_point_id:
+            continue
+        pp = _gos_get_plan_point(pln_point_id, token)
+        if not pp:
+            unresolved.append(pln_point_id)
+            continue
+        prepayment = pp.get("prepayment")
+        if prepayment in [None, "", "null"]:
+            prepayment = 0
+        try:
+            prepayment = float(prepayment)
+        except Exception:
+            prepayment = 0.0
+        if prepayment > advance_percent:
+            advance_percent = prepayment
+    if advance_percent > 0:
+        return {"status": "ok", "advance_percent": _gos_money(advance_percent), "message": "", "unresolved": unresolved}
+    if unresolved:
+        return {
+            "status": "error",
+            "advance_percent": None,
+            "message": f"ОШИБКА: аванс не удалось проверить. Не раскрылись plans/view: {unresolved}",
+            "unresolved": unresolved,
+        }
+    return {"status": "ok", "advance_percent": 0.0, "message": "", "unresolved": []}
+
+
+def _gos_build_row(contract_number: str, token: str) -> Dict[str, Any]:
+    contract = _gos_get_contract_by_number(contract_number, token)
+    contract_id = contract.get("id")
+    if not contract_id:
+        raise Exception("В договоре нет contract_id")
+    try:
+        contract["units"] = _gos_get_contract_units(contract_id, token)
+    except Exception:
+        contract["units"] = {"items": []}
+
+    additions_url = _gos_get_additions_url(contract)
+    is_long_term = 1 if contract.get("ref_contract_year_type_id") == 2 else 0
+    contract_sum = _gos_money(contract.get("contract_sum_wnds"))
+    fact_sum = _gos_money(contract.get("fakt_sum_wnds"))
+    amount_2026 = 0.0
+    amount_2027 = 0.0
+    advance_security_required = None
+    advance_security_attached = None
+    max_end_year = _gos_get_max_end_year(contract)
+    current_block = ""
+    html_status = "not_used"
+    html_error = ""
+
+    if is_long_term == 1:
+        try:
+            additions_text = _gos_get_html_text(additions_url) if additions_url else ""
+            current_block = _gos_extract_current_block(
+                additions_text,
+                contract.get("contract_number_sys") or contract_number,
+            )
+            amounts_by_year = _gos_parse_year_amounts(current_block)
+            totals = _gos_parse_totals(current_block)
+            adv_sec = _gos_parse_advance_security(current_block)
+            amount_2026 = _gos_money(amounts_by_year.get("2026", 0))
+            amount_2027 = 0.0 if (max_end_year is not None and max_end_year <= 2026) else _gos_money(amounts_by_year.get("2027", 0))
+            if totals.get("contract_sum") is not None:
+                contract_sum = _gos_money(totals["contract_sum"])
+            if totals.get("fact_sum") is not None:
+                fact_sum = _gos_money(totals["fact_sum"])
+            advance_security_required = adv_sec["advance_security_required"]
+            advance_security_attached = adv_sec["advance_security_attached"]
+            html_status = "ok"
+        except Exception as e:
+            html_error = str(e)
+            html_status = "error"
+            amount_2026 = f"ОШИБКА HTML: {html_error}"
+            amount_2027 = f"ОШИБКА HTML: {html_error}"
+    else:
+        fin_year = str(contract.get("fin_year") or "")
+        if fin_year == "2026":
+            amount_2026 = contract_sum
+        elif fin_year == "2027":
+            amount_2027 = contract_sum
+
+    advance_data = _gos_extract_advance_percent(contract, token)
+    if advance_data["status"] == "error":
+        advance_percent = advance_data["message"]
+        advance_sum = advance_data["message"]
+        advance_security_required = advance_data["message"]
+        advance_security_attached = advance_data["message"]
+    else:
+        advance_percent = advance_data["advance_percent"]
+        if advance_percent > 0:
+            advance_sum = _gos_money(contract_sum * advance_percent / 100)
+            if not current_block and additions_url:
+                try:
+                    additions_text = _gos_get_html_text(additions_url)
+                    current_block = _gos_extract_current_block(
+                        additions_text,
+                        contract.get("contract_number_sys") or contract_number,
+                    )
+                    adv_sec = _gos_parse_advance_security(current_block)
+                    advance_security_required = adv_sec["advance_security_required"]
+                    advance_security_attached = adv_sec["advance_security_attached"]
+                    html_status = "ok"
+                except Exception as e:
+                    html_status = "error"
+                    html_error = str(e)
+            if html_status != "ok":
+                msg = f"ОШИБКА: HTML не получен: {html_error}"
+                advance_security_required = msg
+                advance_security_attached = msg
+            elif advance_security_required is None:
+                advance_security_required = "ОШИБКА: строка обеспечения не найдена"
+            elif advance_security_attached is None:
+                advance_security_attached = "ОШИБКА: строка обеспечения не найдена"
+        else:
+            advance_percent = 0.0
+            advance_sum = 0.0
+            advance_security_required = 0
+            advance_security_attached = 0
+
+    return {
+        "Ссылка": additions_url,
+        "Многолетний": is_long_term,
+        "Год окончания": max_end_year,
+        "Сумма 2026": amount_2026,
+        "Сумма 2027": amount_2027,
+        "% аванса": advance_percent,
+        "Сумма аванса": advance_sum,
+        "Обеспечение аванса требуется": advance_security_required,
+        "Обеспечение аванса прикреплено": advance_security_attached,
+        "Факт сумма": fact_sum,
+    }
+
+
+def run_code_6_gos(file_bytes: bytes, selected_gos_sheets: List[str], token: str) -> bytes:
+    wb = load_workbook(io.BytesIO(file_bytes))
+
+    for sheet_name in selected_gos_sheets:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+
+        # Найти столбцы «Номер договора» и «Статус» в строке 1
+        col_contract: Optional[int] = None
+        col_status: Optional[int] = None
+        for col_idx in range(1, (ws.max_column or 1) + 1):
+            cell_val = ws.cell(row=1, column=col_idx).value
+            if cell_val is None:
+                continue
+            cv = str(cell_val).strip()
+            if cv == "Номер договора":
+                col_contract = col_idx
+            elif cv == "Статус":
+                col_status = col_idx
+
+        if col_contract is None or col_status is None:
+            continue
+
+        # Начало новых столбцов — после последнего используемого столбца
+        start_col = (ws.max_column or 1) + 1
+
+        # Заголовки новых столбцов в строке 1
+        for j, col_name in enumerate(_GOS_NEW_COLS):
+            ws.cell(row=1, column=start_col + j, value=col_name)
+
+        # Обработка строк
+        for row_idx in range(2, (ws.max_row or 1) + 1):
+            status_val = ws.cell(row=row_idx, column=col_status).value
+            if str(status_val or "").strip() != "Действует":
+                continue
+            contract_number = ws.cell(row=row_idx, column=col_contract).value
+            if not contract_number:
+                continue
+            contract_number = str(contract_number).strip()
+            try:
+                row_data = _gos_build_row(contract_number, token)
+                for j, col_name in enumerate(_GOS_NEW_COLS):
+                    val = row_data.get(col_name)
+                    c = ws.cell(row=row_idx, column=start_col + j)
+                    if col_name == "Ссылка" and val:
+                        c.value = "Открыть"
+                        c.hyperlink = str(val)
+                    else:
+                        c.value = val
+            except Exception as e:
+                ws.cell(row=row_idx, column=start_col, value=f"ОШИБКА: {e}")
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# =========================
 # ?????? ? ????
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
@@ -3479,6 +3888,8 @@ if "prepared_bytes" in st.session_state:
     insights_existing = availability.get("insights_existing_titles") or []
     insights_missing = availability.get("insights_missing_titles") or []
     insights_legacy = availability.get("insights_legacy_titles") or []
+    gos_ok = bool(availability.get("gos_ok"))
+    gos_sheets = availability.get("gos_sheets") or []
 
     opt_profit = st.checkbox("Чистая прибыль", value=False, disabled=(not profit_ok))
     if not profit_ok:
@@ -3542,6 +3953,30 @@ if "prepared_bytes" in st.session_state:
     elif insights_missing and insights_existing:
         st.caption("Будут добавлены только отсутствующие: " + ", ".join(insights_missing) + ".")
 
+    opt_gos = st.checkbox("Госы", value=False, disabled=(not gos_ok))
+    if not gos_ok:
+        st.caption("Госы недоступны: не найдены листы, содержащие «гос» в названии.")
+
+    selected_gos_sheets: List[str] = []
+    gos_token = ""
+    if opt_gos and gos_sheets:
+        st.caption("Выбери листы «гос*» для обработки:")
+        for sh in gos_sheets:
+            pad, col1 = st.columns([1, 6])
+            with pad:
+                st.write("")
+            with col1:
+                on = st.checkbox(sh, value=False, key=f"gos_pick::{sh}")
+            if on:
+                selected_gos_sheets.append(sh)
+        gos_token = st.text_input(
+            "Токен API goszakup.gov.kz",
+            value="",
+            placeholder="Вставьте токен…",
+            type="password",
+            key="gos_token_input",
+        )
+
     selected_modes: List[str] = []
     if opt_saldo:
         selected_modes.append("Сальдо")
@@ -3551,10 +3986,11 @@ if "prepared_bytes" in st.session_state:
     st.write("")
     st.markdown("#### Запуск")
 
-    has_any_mode = bool(selected_modes) or opt_inventory or opt_profit or opt_insights
+    has_any_mode = bool(selected_modes) or opt_inventory or opt_profit or opt_insights or opt_gos
     inventory_ok = (not opt_inventory) or bool(inventory_accounts)
     profit_sel_ok = (not opt_profit) or bool(selected_obsh)
-    run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok) or (not profit_sel_ok)))
+    gos_sel_ok = (not opt_gos) or (bool(selected_gos_sheets) and bool(gos_token))
+    run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok) or (not profit_sel_ok) or (not gos_sel_ok)))
 
     status_box = st.empty()
     progress = st.progress(0)
@@ -3603,6 +4039,12 @@ if "prepared_bytes" in st.session_state:
                 progress.progress(97)
                 out_bytes = run_code_5_insights(out_bytes)
                 progress.progress(99)
+
+            if opt_gos and selected_gos_sheets:
+                status_box.info("Обработка: Госы (запросы к API, может занять время)…")
+                progress.progress(99)
+                out_bytes = run_code_6_gos(out_bytes, selected_gos_sheets, gos_token)
+
             st.session_state["processed_bytes"] = out_bytes
             st.session_state["processed_name"] = st.session_state.get("prepared_name") or "output.xlsx"
             status_box.success("Готово.")
