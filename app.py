@@ -1127,6 +1127,16 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
     }
 
 
+def compute_mergeable_osv_from_wb(wb) -> Dict[str, List[str]]:
+    """Возвращает {account: [sheet1, sheet2, ...]} для счетов, у которых ≥2 листа в одной книге."""
+    osv_by_account: Dict[str, List[str]] = defaultdict(list)
+    for sh in wb.sheetnames:
+        _, suf4 = split_prefix_suffix4(sh)
+        if suf4.isdigit() and len(suf4) == 4:
+            osv_by_account[suf4].append(sh)
+    return {acc: sheets for acc, sheets in osv_by_account.items() if len(sheets) >= 2}
+
+
 def find_existing_saldo_prefixes(wb) -> Dict[str, Set[str]]:
     """For each saldo account (1210/1710/3310/3510), returns existing prefixes found in sheetnames."""
     accounts = {"1210", "1710", "3310", "3510"}
@@ -1374,7 +1384,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                 best_key = key
         return best
 
-    TOP_N = 30
+    TOP_N = 100
 
     def _topn_pos_neg(df: pd.DataFrame, col: str) -> pd.DataFrame:
         if df is None or df.empty or col not in df.columns:
@@ -1547,13 +1557,24 @@ def run_code_1(file_bytes: bytes) -> bytes:
         ws2 = wb.create_sheet(out2_name, insert_index) if insert_index is not None else wb.create_sheet(out2_name)
 
         ws2["A1"] = "Все значения указаны в тысячах тенге"
-        ws2["A1"].font = Font(name="Arial", size=9, bold=True)
+        ws2["A1"].font = Font(name="Arial", size=8, bold=True)
 
-        # На "сальд" везде используем Aptos Narrow 9.
-        font_h = Font(name="Arial", size=9, bold=True)
-        font_b = Font(name="Arial", size=9)
-        font_bb = Font(name="Arial", size=9, bold=True)
+        # На "сальд" везде используем Arial 8.
+        font_h  = Font(name="Arial", size=8, bold=True)
+        font_b  = Font(name="Arial", size=8)
+        font_bb = Font(name="Arial", size=8, bold=True)
+        font_key = Font(name="Arial", size=8, color="B3B3B3")  # серый ключ
         align_c = Alignment(horizontal="center")
+
+        def _make_key(name: str) -> str:
+            """Ключ контрагента (Python): строчные, без пробелов и знаков препинания."""
+            if not name:
+                return ""
+            s = name
+            for ch in ["–", "—", " ", " ", ">", "<", "_", "?", ".", ",", "(", ")", "-", '"']:
+                s = s.replace(ch, "")
+            return s.lower()
+
         align_l = Alignment(horizontal="left")
         num_fmt = "#,##0;[Red](#,##0)"
 
@@ -1598,7 +1619,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
         # Визуальные разделители: "ЗАКАЗЧИКИ" (до колонок L/M, не залезаем на блок месяцев)
         sec_fill = PatternFill(fill_type="solid", fgColor="1F2937")
-        sec_font = Font(name="Arial", size=9, bold=True, color="FFFFFF")
+        sec_font = Font(name="Arial", size=8, bold=True, color="FFFFFF")
         for col in range(2, last_used_col + 1):  # B..(конец таблицы)
             c = ws2.cell(row=1, column=col)
             c.fill = sec_fill
@@ -1692,6 +1713,10 @@ def run_code_1(file_bytes: bytes) -> bytes:
             v3510: int,
             vsaldo: int,
         ) -> None:
+            # Колонка A: ключ контрагента (значение, серый)
+            ws2.cell(row=r, column=1, value=_make_key(contr)).font = font_key
+            ws2.cell(row=r, column=1).alignment = align_l
+
             ws2.cell(row=r, column=2, value=contr).font = font_b
             ws2.cell(row=r, column=2).alignment = align_l
 
@@ -1734,8 +1759,8 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     column=ci,
                     value=(
                         f'=IF($B{r}="","",'
-                        f'SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"1210",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
-                        f'+SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"3510",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$R:$R,$B{r})'
+                        f'SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"1210",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Z:$Z,$A{r})'
+                        f'+SUMIFS({wr_ref}!$F:$F,{wr_ref}!$G:$G,"3510",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Z:$Z,$A{r})'
                         f')'
                     ),
                 ).number_format = num_fmt
@@ -1750,7 +1775,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     row=r,
                     column=ci,
                     value=(
-                        f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Q:$Q,$B{r},{mr_ref}!$G:$G,"6010")*{coef})'
+                        f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Y:$Y,$A{r},{mr_ref}!$G:$G,"6010")*{coef})'
                     ),
                 ).number_format = num_fmt
                 ws2.cell(row=r, column=ci).alignment = align_c
@@ -1767,6 +1792,10 @@ def run_code_1(file_bytes: bytes) -> bytes:
             v3310: int,
             vsaldo: int,
         ) -> None:
+            # Колонка A: ключ контрагента (значение, серый)
+            ws2.cell(row=r, column=1, value=_make_key(contr)).font = font_key
+            ws2.cell(row=r, column=1).alignment = align_l
+
             ws2.cell(row=r, column=2, value=contr).font = font_b
             ws2.cell(row=r, column=2).alignment = align_l
 
@@ -1801,8 +1830,8 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     column=ci,
                     value=(
                         f'=IF($B{r}="","",'
-                        f'SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"1710",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
-                        f'+SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"3310",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Q:$Q,$B{r})'
+                        f'SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"1710",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Y:$Y,$A{r})'
+                        f'+SUMIFS({wr_ref}!$H:$H,{wr_ref}!$E:$E,"3310",{wr_ref}!$P:$P,{col_letter}$2,{wr_ref}!$Y:$Y,$A{r})'
                         f')'
                     ),
                 ).number_format = num_fmt
@@ -2247,7 +2276,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
         ws2.column_dimensions["A"].width = 6
         ws2.column_dimensions["B"].width = 35
         for col in ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"]:
-            ws2.column_dimensions[col].width = 18
+            ws2.column_dimensions[col].width = 10.14
 
         # Пунктирные границы серого цвета вокруг блоков (для читабельности)
         dotted_side = Side(border_style="dotted", color="A0A0A0")
@@ -3769,6 +3798,315 @@ def run_code_7_group_osv(file_bytes: bytes, selected_groups: Dict[str, List[str]
 
 
 # =========================
+# CODE 8 (Объединение ОСВ по счёту)
+# Берёт ≥2 листа с одинаковым 4-значным суффиксом счёта (например 1210),
+# определяет их хронологический порядок по датам в шапке,
+# сливает строки (дубликаты убираются), суммирует обороты,
+# BOP берёт из самого старого листа, EOP считает сам,
+# создаёт новый лист с идентичным форматированием и удаляет источники.
+# =========================
+
+_YEAR_RE = re.compile(r'\d{4}')
+_OSV_DASH_RE = re.compile(r'\s*[–—-]\s*')
+
+
+def _get_osv_header_text(ws, account: str) -> Optional[str]:
+    """Возвращает полный текст ячейки с номером счёта из первых 5 строк."""
+    for r in range(1, min(6, (ws.max_row or 1) + 1)):
+        for c in range(1, min((ws.max_column or 1) + 1, 25)):
+            v = ws.cell(row=r, column=c).value
+            if v is not None and account in str(v):
+                return str(v).strip()
+    return None
+
+
+def _get_osv_end_year(ws, account: str) -> Optional[int]:
+    """
+    Сканирует первые 5 строк листа, ищет ячейку с номером счёта,
+    берёт текст ПОСЛЕ него и возвращает максимальный год (1900-2100).
+    Это год конца периода — по нему определяем, какой лист старее.
+
+    Работает для любого формата:
+      "...по счету 1210 за 01.01.2025 - 10.07.2025"  -> 2025
+      "...по счету 1710 за Январь 2025 г. - Июнь 2026" -> 2026
+    """
+    for r in range(1, min(6, (ws.max_row or 1) + 1)):
+        for c in range(1, min((ws.max_column or 1) + 1, 25)):
+            v = ws.cell(row=r, column=c).value
+            if v is None:
+                continue
+            s = str(v)
+            idx = s.find(account)
+            if idx == -1:
+                continue
+            tail = s[idx + len(account):]
+            years = [int(y) for y in _YEAR_RE.findall(tail) if 1900 <= int(y) <= 2100]
+            if years:
+                return max(years)
+    return None
+
+
+def _read_osv_data_for_merge(ws, account: str) -> Dict[str, Dict[str, float]]:
+    """
+    Читает строки между строкой счёта и «Итого», возвращает:
+    {name: {bop_dt, bop_kt, turn_dt, turn_kt, eop_dt, eop_kt}}
+    Колонки: A=1 (name), C=3 (bop_dt), D=4 (bop_kt),
+             E=5 (turn_dt), F=6 (turn_kt), G=7 (eop_dt), H=8 (eop_kt).
+    """
+    start_row = find_first_row_with_value(ws, account, col=1)
+    end_row = find_first_row_with_value(ws, "Итого", col=1)
+    if end_row is None:
+        for r in range(1, (ws.max_row or 1) + 1):
+            v = ws.cell(row=r, column=1).value
+            if v and str(v).strip().lower().startswith("итого"):
+                end_row = r
+                break
+    if not start_row or not end_row or end_row <= start_row:
+        return {}
+
+    result: Dict[str, Dict[str, float]] = {}
+    for r in range(start_row + 1, end_row):
+        raw = ws.cell(row=r, column=1).value
+        if raw is None:
+            continue
+        name = str(raw).strip()
+        if not name or name.lower().startswith("итого") or name == account:
+            continue
+        vals = {
+            "bop_dt":  to_number(ws.cell(row=r, column=3).value) or 0.0,
+            "bop_kt":  to_number(ws.cell(row=r, column=4).value) or 0.0,
+            "turn_dt": to_number(ws.cell(row=r, column=5).value) or 0.0,
+            "turn_kt": to_number(ws.cell(row=r, column=6).value) or 0.0,
+            "eop_dt":  to_number(ws.cell(row=r, column=7).value) or 0.0,
+            "eop_kt":  to_number(ws.cell(row=r, column=8).value) or 0.0,
+        }
+        if any(abs(v) > 1e-9 for v in vals.values()):
+            result[name] = vals
+    return result
+
+
+def run_code_8_merge_osv(file_bytes: bytes, merge_groups: Dict[str, List[str]]) -> bytes:
+    """
+    merge_groups: {account: [sheet_name, ...]}  — листы для объединения.
+    Для каждой группы:
+      • определяет хронологический порядок по датам шапки,
+      • BOP берёт из самого старого листа,
+      • обороты суммирует по всем,
+      • EOP рассчитывает по правилу дебет/кредит счёта,
+      • создаёт новый лист с форматированием как у clean_osv_sheet_inplace,
+      • удаляет исходные листы.
+    """
+    wb = load_workbook(io.BytesIO(file_bytes))
+    num_fmt_osv = "#,##0; -#,##0"
+
+    for account, sheet_names in merge_groups.items():
+        valid = [s for s in sheet_names if s in wb.sheetnames]
+        if len(valid) < 2:
+            continue
+
+        # ── 1. Определяем порядок: по году конца периода из строки «Оборотно…» ──
+        # _get_osv_end_year ищет максимальный год (1900-2100) в тексте ПОСЛЕ
+        # номера счёта в первых 5 строках листа. Меньший год = старее.
+        year_by_sheet: Dict[str, int] = {}
+        for sn in valid:
+            y = _get_osv_end_year(wb[sn], account)
+            year_by_sheet[sn] = y if y is not None else 9999
+
+        valid_sorted = sorted(valid, key=lambda sn: year_by_sheet[sn])
+
+        oldest_header = _get_osv_header_text(wb[valid_sorted[0]], account)
+        newest_header = _get_osv_header_text(wb[valid_sorted[-1]], account)
+
+        period_text = ""
+        if oldest_header and newest_header and valid_sorted[0] != valid_sorted[-1]:
+            # Начало периода — из старого: всё до первого даша
+            m_old = _OSV_DASH_RE.search(oldest_header)
+            start_part = oldest_header[:m_old.start()].rstrip() if m_old else oldest_header
+            # Конец периода — из нового: всё после последнего даша
+            m_new_iter = list(_OSV_DASH_RE.finditer(newest_header))
+            end_part = newest_header[m_new_iter[-1].end():].strip() if m_new_iter else newest_header
+            period_text = f"{start_part} – {end_part}" if end_part else oldest_header
+        elif oldest_header:
+            period_text = oldest_header
+        else:
+            years_found = [year_by_sheet[sn] for sn in valid_sorted if year_by_sheet[sn] != 9999]
+            if len(years_found) >= 2:
+                period_text = f"{years_found[0]} – {years_found[-1]}"
+            elif years_found:
+                period_text = str(years_found[0])
+
+        oldest_sn = valid_sorted[0]
+        ws_oldest = wb[oldest_sn]
+        company_label = extract_company_label_from_a1(ws_oldest)
+
+        # ── 2. Читаем данные ────────────────────────────────────────────
+        # BOP — только из самого старого листа
+        data_old = _read_osv_data_for_merge(ws_oldest, account)
+
+        merged: Dict[str, Dict[str, float]] = {}
+        for name, vals in data_old.items():
+            merged[name] = {
+                "bop_dt":  vals["bop_dt"],
+                "bop_kt":  vals["bop_kt"],
+                "turn_dt": 0.0,
+                "turn_kt": 0.0,
+            }
+
+        # Обороты суммируем из ВСЕХ листов (в хронологическом порядке)
+        for sn in valid_sorted:
+            ws_src = wb[sn]
+            data_src = _read_osv_data_for_merge(ws_src, account)
+            for name, vals in data_src.items():
+                if name not in merged:
+                    merged[name] = {"bop_dt": 0.0, "bop_kt": 0.0, "turn_dt": 0.0, "turn_kt": 0.0}
+                merged[name]["turn_dt"] += vals["turn_dt"]
+                merged[name]["turn_kt"] += vals["turn_kt"]
+
+        # ── 3. Рассчитываем EOP ─────────────────────────────────────────
+        first_digit = int(account[0]) if account and account[0].isdigit() else 1
+        is_debit_account = first_digit <= 2  # 1xxx/2xxx — дебетовые; 3xxx+ — кредитовые
+
+        for name, vals in merged.items():
+            if is_debit_account:
+                net = vals["bop_dt"] - vals["bop_kt"] + vals["turn_dt"] - vals["turn_kt"]
+                vals["eop_dt"] = max(net, 0.0)
+                vals["eop_kt"] = max(-net, 0.0)
+            else:
+                net = vals["bop_kt"] - vals["bop_dt"] + vals["turn_kt"] - vals["turn_dt"]
+                vals["eop_kt"] = max(net, 0.0)
+                vals["eop_dt"] = max(-net, 0.0)
+
+        # Убираем строки где всё нули
+        merged = {
+            name: vals for name, vals in merged.items()
+            if any(abs(v) > 1e-9 for v in vals.values())
+        }
+
+        # ── 4. Сортировка: убываем по рабочей стороне EOP ──────────────
+        eop_key = "eop_dt" if is_debit_account else "eop_kt"
+        sorted_rows = sorted(merged.items(), key=lambda x: x[1][eop_key], reverse=True)
+
+        # ── 5. Итого ────────────────────────────────────────────────────
+        itogo: Dict[str, float] = {"bop_dt": 0.0, "bop_kt": 0.0, "turn_dt": 0.0,
+                                    "turn_kt": 0.0, "eop_dt": 0.0, "eop_kt": 0.0}
+        for _, vals in sorted_rows:
+            for k in itogo:
+                itogo[k] += vals[k]
+
+        # ── 6. Создаём новый лист ───────────────────────────────────────
+        # Вставляем на место первого исходного листа
+        first_idx = next((i for i, sn in enumerate(wb.sheetnames) if sn == valid[0]), None)
+
+        # Имя: если у всех листов один и тот же prefix — сохраняем его
+        prefixes = [split_prefix_suffix4(sn)[0].strip() for sn in valid]
+        common_prefix = prefixes[0] if len(set(prefixes)) == 1 else ""
+        new_title = make_unique_with_fixed_suffix(wb, common_prefix, account)
+
+        ws_new = (wb.create_sheet(new_title, first_idx)
+                  if first_idx is not None else wb.create_sheet(new_title))
+
+        # Шапка
+        ws_new.cell(row=1, column=1, value=company_label or f"ОСВ по счёту {account}")
+        ws_new.cell(row=2, column=1, value=period_text)
+
+        ACCOUNT_ROW = 3
+        # Строка счёта (заголовки колонок)
+        hdrs = {
+            1: account,
+            3: "Сальдо нач Дт",
+            4: "Сальдо нач Кт",
+            5: "Обороты Дт",
+            6: "Обороты Кт",
+            7: "Сальдо кон Дт",
+            8: "Сальдо кон Кт",
+        }
+        font_hdr = Font(name="Arial", size=9, bold=True)
+        align_c  = Alignment(horizontal="center", vertical="center")
+        align_l  = Alignment(horizontal="left",   vertical="center")
+        align_r  = Alignment(horizontal="right",  vertical="center")
+
+        for col, val in hdrs.items():
+            cell = ws_new.cell(row=ACCOUNT_ROW, column=col, value=val)
+            cell.font = font_hdr
+            cell.alignment = align_l if col == 1 else align_c
+            cell.number_format = num_fmt_osv if col >= 3 else "@"
+
+        # Строки данных
+        DATA_START = ACCOUNT_ROW + 1
+        font_body = Font(name="Arial", size=9)
+        font_neg  = Font(name="Arial", size=9, color="FFCC0000")
+        total_col = 7 if is_debit_account else 8
+
+        for i, (name, vals) in enumerate(sorted_rows):
+            r = DATA_START + i
+            ws_new.cell(row=r, column=1, value=name).alignment = align_l
+            ws_new.cell(row=r, column=1).font = font_body
+
+            for col, key in [(3, "bop_dt"), (4, "bop_kt"), (5, "turn_dt"),
+                             (6, "turn_kt"), (7, "eop_dt"), (8, "eop_kt")]:
+                v = vals[key]
+                cell = ws_new.cell(row=r, column=col, value=v if abs(v) > 1e-9 else None)
+                cell.number_format = num_fmt_osv
+                cell.alignment = align_r
+                cell.font = font_neg if (col == total_col and v < 0) else font_body
+
+        # Строка Итого
+        ITOGO_ROW = DATA_START + len(sorted_rows)
+        ws_new.cell(row=ITOGO_ROW, column=1, value="Итого").font = font_hdr
+        ws_new.cell(row=ITOGO_ROW, column=1).alignment = align_l
+        for col, key in [(3, "bop_dt"), (4, "bop_kt"), (5, "turn_dt"),
+                         (6, "turn_kt"), (7, "eop_dt"), (8, "eop_kt")]:
+            v = itogo[key]
+            cell = ws_new.cell(row=ITOGO_ROW, column=col, value=v if abs(v) > 1e-9 else None)
+            cell.number_format = num_fmt_osv
+            cell.alignment = align_r
+            cell.font = font_hdr
+
+        # ── 7. Форматирование (идентично clean_osv_sheet_inplace) ───────
+        ws_new.column_dimensions["A"].width = 50
+        for col_letter in ["B", "C", "D", "E", "F", "G", "H"]:
+            ws_new.column_dimensions[col_letter].width = 18
+        set_all_rows_height(ws_new, 12)
+
+        # Статус-ячейки (как в clean_osv_sheet_inplace): проверяем сходимость итого
+        try:
+            expected = itogo[eop_key]
+            actual = sum(vals[eop_key] for _, vals in sorted_rows)
+            diff_pct = 0.0 if abs(expected) < 1e-9 else abs(actual - expected) / abs(expected)
+            pct_col = total_col
+            status_col = total_col - 1
+            out_cell = ws_new.cell(row=1, column=pct_col)
+            out_cell.value = float(diff_pct)
+            out_cell.number_format = "0.0%"
+            out_cell.font = Font(name="Arial", size=9, bold=True, color="FF4B5563")
+            out_cell.alignment = align_c
+
+            status_cell = ws_new.cell(row=1, column=status_col)
+            status_cell.font = Font(name="Arial", size=9, bold=True, color="FF111827")
+            status_cell.alignment = align_c
+            if diff_pct <= 1e-12:
+                status_cell.value = "MATCH"
+                status_cell.fill = PatternFill(fill_type="solid", fgColor="FFE4F0DD")
+            elif diff_pct < 0.10:
+                status_cell.value = "MISMATCH"
+                status_cell.fill = PatternFill(fill_type="solid", fgColor="FFFFF2CC")
+            else:
+                status_cell.value = "CHECK"
+                status_cell.fill = PatternFill(fill_type="solid", fgColor="FFFCE4EC")
+        except Exception:
+            pass
+
+        # ── 8. Удаляем исходные листы ───────────────────────────────────
+        for sn in valid_sorted:
+            if sn in wb.sheetnames:
+                del wb[sn]
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# =========================
 # ?????? ? ????
 # =========================
 st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
@@ -4358,6 +4696,61 @@ if "prepared_bytes" in st.session_state:
                 if st.checkbox(label, value=False, key=f"grp_pick::{suf}"):
                     selected_groups[suf] = sheets_in_group
 
+    # ── Объединение ОСВ по счёту (модуль 8) ─────────────────────────────
+    try:
+        _tmp_wb8 = load_workbook(io.BytesIO(st.session_state["prepared_bytes"]), read_only=True)
+        mergeable_osv: Dict[str, List[str]] = compute_mergeable_osv_from_wb(_tmp_wb8)
+        _tmp_wb8.close()
+    except Exception:
+        mergeable_osv = {}
+    merge_osv_ok = bool(mergeable_osv)
+
+    opt_merge_osv = st.checkbox("Объединить ОСВ по счёту", value=False, disabled=(not merge_osv_ok))
+    if not merge_osv_ok:
+        st.caption("Недоступно: нет счетов, у которых ≥2 листа с одинаковым 4-значным суффиксом.")
+
+    selected_merge_osv: Dict[str, List[str]] = {}
+    if opt_merge_osv and mergeable_osv:
+        st.caption(
+            "Порядок листов определяется автоматически по году в строке «Оборотно-сальдовая ведомость…»."
+        )
+
+        # Читаем год конца периода для каждого ОСВ-листа
+        _year_cache: Dict[str, Optional[int]] = {}
+        try:
+            _tmp_wb8b = load_workbook(io.BytesIO(st.session_state["prepared_bytes"]), read_only=True)
+            for _sn in _tmp_wb8b.sheetnames:
+                _, _suf = split_prefix_suffix4(_sn)
+                if _suf.isdigit() and len(_suf) == 4:
+                    try:
+                        _year_cache[_sn] = _get_osv_end_year(_tmp_wb8b[_sn], _suf)
+                    except Exception:
+                        _year_cache[_sn] = None
+            _tmp_wb8b.close()
+        except Exception:
+            pass
+
+        for acc in sorted(mergeable_osv.keys()):
+            sheets = mergeable_osv[acc]
+            sheets_by_year = sorted(sheets, key=lambda s: _year_cache.get(s) or 9999)
+
+            def _lbl(sn: str) -> str:
+                y = _year_cache.get(sn)
+                return f"{sn} [{y}]" if y else f"{sn} [год ?]"
+
+            cb_label = f"Счёт {acc}:  " + "  +  ".join(_lbl(s) for s in sheets_by_year)
+            pad, col1 = st.columns([1, 6])
+            with pad:
+                st.write("")
+            with col1:
+                if st.checkbox(cb_label, value=False, key=f"merge_osv::{acc}"):
+                    if any(_year_cache.get(s) is None for s in sheets):
+                        st.caption(
+                            f"  ⚠ Год не найден у части листов — порядок может быть неверным. "
+                            f"Убедись, что в строке «Оборотно-сальдовая ведомость» есть год."
+                        )
+                    selected_merge_osv[acc] = sheets_by_year
+
     selected_modes: List[str] = []
     if opt_saldo:
         selected_modes.append("Сальдо")
@@ -4367,12 +4760,18 @@ if "prepared_bytes" in st.session_state:
     st.write("")
     st.markdown("#### Запуск")
 
-    has_any_mode = bool(selected_modes) or opt_inventory or opt_profit or opt_insights or opt_gos or (opt_group_osv and bool(selected_groups))
+    has_any_mode = (bool(selected_modes) or opt_inventory or opt_profit or opt_insights
+                    or opt_gos or (opt_group_osv and bool(selected_groups))
+                    or (opt_merge_osv and bool(selected_merge_osv)))
     inventory_ok = (not opt_inventory) or bool(inventory_accounts)
     profit_sel_ok = (not opt_profit) or bool(selected_obsh)
     gos_sel_ok = (not opt_gos) or (bool(selected_gos_sheets) and bool(gos_token))
     group_osv_sel_ok = (not opt_group_osv) or bool(selected_groups)
-    run_btn = st.button("Обработать", disabled=((not has_any_mode) or (not inventory_ok) or (not profit_sel_ok) or (not gos_sel_ok) or (not group_osv_sel_ok)))
+    merge_osv_sel_ok = (not opt_merge_osv) or bool(selected_merge_osv)
+    run_btn = st.button("Обработать", disabled=(
+        (not has_any_mode) or (not inventory_ok) or (not profit_sel_ok)
+        or (not gos_sel_ok) or (not group_osv_sel_ok) or (not merge_osv_sel_ok)
+    ))
 
     status_box = st.empty()
     progress = st.progress(0)
@@ -4431,6 +4830,11 @@ if "prepared_bytes" in st.session_state:
                 status_box.info("Обработка: объединение ОСВ по группе…")
                 progress.progress(99)
                 out_bytes = run_code_7_group_osv(out_bytes, selected_groups)
+
+            if opt_merge_osv and selected_merge_osv:
+                status_box.info("Обработка: объединение ОСВ по счёту…")
+                progress.progress(99)
+                out_bytes = run_code_8_merge_osv(out_bytes, selected_merge_osv)
 
             st.session_state["processed_bytes"] = out_bytes
             st.session_state["processed_name"] = st.session_state.get("prepared_name") or "output.xlsx"
