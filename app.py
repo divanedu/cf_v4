@@ -1571,7 +1571,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
             if not name:
                 return ""
             s = name
-            for ch in ["–", "—", " ", " ", ">", "<", "_", "?", ".", ",", "(", ")", "-", '"']:
+            for ch in ["-", "\u2013", "\u2014", " ", "\u00a0", ">", "<", "_", "?", ".", ",", "(", ")", "\"", "/", "\\", "!", ":", ";", "@", "#", "$", "%", "^", "&", "*", "+", "=", "|", "~", "`", "[", "]", "{", "}", "\u00ab", "\u00bb", "\u2018", "\u2019", "\u201c", "\u201d"]:
                 s = s.replace(ch, "")
             return s.lower()
 
@@ -4881,3 +4881,4 @@ if "prepared_bytes" in st.session_state:
             mime=download_mime,
             use_container_width=True,
         )
+    
