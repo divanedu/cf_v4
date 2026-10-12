@@ -1450,13 +1450,28 @@ def run_code_1(file_bytes: bytes) -> bytes:
             }
             sheet_metrics[suf] = m
 
-        s1210 = sheet_data.get("1210", pd.Series(dtype=float))
-        s3510 = sheet_data.get("3510", pd.Series(dtype=float))
-        s1710 = sheet_data.get("1710", pd.Series(dtype=float))
-        s3310 = sheet_data.get("3310", pd.Series(dtype=float))
+        m1210 = sheet_metrics.get("1210", {})
+        m3510 = sheet_metrics.get("3510", {})
+        m1710 = sheet_metrics.get("1710", {})
+        m3310 = sheet_metrics.get("3310", {})
 
-        cust_set = set(s1210.index).union(set(s3510.index))
-        supp_set = set(s1710.index).union(set(s3310.index))
+        def _ser(m: Dict[str, pd.Series], key: str) -> pd.Series:
+            s = m.get(key)
+            return s if isinstance(s, pd.Series) else pd.Series(dtype=float)
+
+        # G(eop_deb) и H(eop_cred) с обоих счетов — в cust_set/supp_set
+        cust_set = (
+            set(_ser(m1210, "eop_deb").index)
+            .union(set(_ser(m1210, "eop_cred").index))
+            .union(set(_ser(m3510, "eop_deb").index))
+            .union(set(_ser(m3510, "eop_cred").index))
+        )
+        supp_set = (
+            set(_ser(m1710, "eop_deb").index)
+            .union(set(_ser(m1710, "eop_cred").index))
+            .union(set(_ser(m3310, "eop_deb").index))
+            .union(set(_ser(m3310, "eop_cred").index))
+        )
         all_set = cust_set.union(supp_set)
 
         if not cust_set and not supp_set:
@@ -1465,17 +1480,22 @@ def run_code_1(file_bytes: bytes) -> bytes:
         if cust_set:
             df_cust = pd.DataFrame(sorted(cust_set), columns=["Контрагент"])
 
-            m1210 = sheet_metrics.get("1210", {})
-            m3510 = sheet_metrics.get("3510", {})
-
-            def _ser(m: Dict[str, pd.Series], key: str) -> pd.Series:
-                s = m.get(key)
-                return s if isinstance(s, pd.Series) else pd.Series(dtype=float)
-
-            df_cust["1210"] = df_cust["Контрагент"].map(s1210).fillna(0) / 1000
-            df_cust["3510"] = df_cust["Контрагент"].map(s3510).fillna(0) / 1000
-            df_cust["1210_нач"] = df_cust["Контрагент"].map(_ser(m1210, "bop_deb")).fillna(0) / 1000
-            df_cust["3510_нач"] = df_cust["Контрагент"].map(_ser(m3510, "bop_cred")).fillna(0) / 1000
+            df_cust["1210"] = (
+                df_cust["Контрагент"].map(_ser(m1210, "eop_deb")).fillna(0)
+                + df_cust["Контрагент"].map(_ser(m3510, "eop_deb")).fillna(0)
+            ) / 1000
+            df_cust["3510"] = (
+                df_cust["Контрагент"].map(_ser(m1210, "eop_cred")).fillna(0)
+                + df_cust["Контрагент"].map(_ser(m3510, "eop_cred")).fillna(0)
+            ) / 1000
+            df_cust["1210_нач"] = (
+                df_cust["Контрагент"].map(_ser(m1210, "bop_deb")).fillna(0)
+                + df_cust["Контрагент"].map(_ser(m3510, "bop_deb")).fillna(0)
+            ) / 1000
+            df_cust["3510_нач"] = (
+                df_cust["Контрагент"].map(_ser(m1210, "bop_cred")).fillna(0)
+                + df_cust["Контрагент"].map(_ser(m3510, "bop_cred")).fillna(0)
+            ) / 1000
             df_cust["нетто_нач"] = df_cust["1210_нач"] - df_cust["3510_нач"]
             df_cust["оборот_дт"] = (
                 df_cust["Контрагент"].map(_ser(m1210, "turn_deb")).fillna(0)
@@ -1497,17 +1517,22 @@ def run_code_1(file_bytes: bytes) -> bytes:
         if supp_set:
             df_supp = pd.DataFrame(sorted(supp_set), columns=["Контрагент"])
 
-            m1710 = sheet_metrics.get("1710", {})
-            m3310 = sheet_metrics.get("3310", {})
-
-            def _ser(m: Dict[str, pd.Series], key: str) -> pd.Series:
-                s = m.get(key)
-                return s if isinstance(s, pd.Series) else pd.Series(dtype=float)
-
-            df_supp["1710"] = df_supp["Контрагент"].map(s1710).fillna(0) / 1000
-            df_supp["3310"] = df_supp["Контрагент"].map(s3310).fillna(0) / 1000
-            df_supp["1710_нач"] = df_supp["Контрагент"].map(_ser(m1710, "bop_deb")).fillna(0) / 1000
-            df_supp["3310_нач"] = df_supp["Контрагент"].map(_ser(m3310, "bop_cred")).fillna(0) / 1000
+            df_supp["1710"] = (
+                df_supp["Контрагент"].map(_ser(m1710, "eop_deb")).fillna(0)
+                + df_supp["Контрагент"].map(_ser(m3310, "eop_deb")).fillna(0)
+            ) / 1000
+            df_supp["3310"] = (
+                df_supp["Контрагент"].map(_ser(m1710, "eop_cred")).fillna(0)
+                + df_supp["Контрагент"].map(_ser(m3310, "eop_cred")).fillna(0)
+            ) / 1000
+            df_supp["1710_нач"] = (
+                df_supp["Контрагент"].map(_ser(m1710, "bop_deb")).fillna(0)
+                + df_supp["Контрагент"].map(_ser(m3310, "bop_deb")).fillna(0)
+            ) / 1000
+            df_supp["3310_нач"] = (
+                df_supp["Контрагент"].map(_ser(m1710, "bop_cred")).fillna(0)
+                + df_supp["Контрагент"].map(_ser(m3310, "bop_cred")).fillna(0)
+            ) / 1000
             df_supp["нетто_нач"] = df_supp["1710_нач"] - df_supp["3310_нач"]
             df_supp["оборот_дт"] = (
                 df_supp["Контрагент"].map(_ser(m1710, "turn_deb")).fillna(0)
@@ -1528,10 +1553,22 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
         if all_set:
             df_total = pd.DataFrame(sorted(all_set), columns=["Контрагент"])
-            df_total["1210"] = df_total["Контрагент"].map(s1210).fillna(0) / 1000
-            df_total["1710"] = df_total["Контрагент"].map(s1710).fillna(0) / 1000
-            df_total["3310"] = df_total["Контрагент"].map(s3310).fillna(0) / 1000
-            df_total["3510"] = df_total["Контрагент"].map(s3510).fillna(0) / 1000
+            df_total["1210"] = (
+                df_total["Контрагент"].map(_ser(m1210, "eop_deb")).fillna(0)
+                + df_total["Контрагент"].map(_ser(m3510, "eop_deb")).fillna(0)
+            ) / 1000
+            df_total["1710"] = (
+                df_total["Контрагент"].map(_ser(m1710, "eop_deb")).fillna(0)
+                + df_total["Контрагент"].map(_ser(m3310, "eop_deb")).fillna(0)
+            ) / 1000
+            df_total["3310"] = (
+                df_total["Контрагент"].map(_ser(m1710, "eop_cred")).fillna(0)
+                + df_total["Контрагент"].map(_ser(m3310, "eop_cred")).fillna(0)
+            ) / 1000
+            df_total["3510"] = (
+                df_total["Контрагент"].map(_ser(m1210, "eop_cred")).fillna(0)
+                + df_total["Контрагент"].map(_ser(m3510, "eop_cred")).fillna(0)
+            ) / 1000
             df_total["общее сальдо"] = df_total["1210"] + df_total["1710"] - df_total["3310"] - df_total["3510"]
             df_total = df_total.sort_values(by="общее сальдо", ascending=False).reset_index(drop=True)
         else:
@@ -3827,8 +3864,8 @@ def _get_osv_end_year(ws, account: str) -> Optional[int]:
     Это год конца периода — по нему определяем, какой лист старее.
 
     Работает для любого формата:
-      "...по счету 1210 за 01.01.2025 - 10.07.2025"  -> 2025
-      "...по счету 1710 за Январь 2025 г. - Июнь 2026" -> 2026
+    "...по счету 1210 за 01.01.2025 - 10.07.2025"  -> 2025
+    "...по счету 1710 за Январь 2025 г. - Июнь 2026" -> 2026
     """
     for r in range(1, min(6, (ws.max_row or 1) + 1)):
         for c in range(1, min((ws.max_column or 1) + 1, 25)):
@@ -3851,7 +3888,7 @@ def _read_osv_data_for_merge(ws, account: str) -> Dict[str, Dict[str, float]]:
     Читает строки между строкой счёта и «Итого», возвращает:
     {name: {bop_dt, bop_kt, turn_dt, turn_kt, eop_dt, eop_kt}}
     Колонки: A=1 (name), C=3 (bop_dt), D=4 (bop_kt),
-             E=5 (turn_dt), F=6 (turn_kt), G=7 (eop_dt), H=8 (eop_kt).
+            E=5 (turn_dt), F=6 (turn_kt), G=7 (eop_dt), H=8 (eop_kt).
     """
     start_row = find_first_row_with_value(ws, account, col=1)
     end_row = find_first_row_with_value(ws, "Итого", col=1)
@@ -3889,12 +3926,12 @@ def run_code_8_merge_osv(file_bytes: bytes, merge_groups: Dict[str, List[str]]) 
     """
     merge_groups: {account: [sheet_name, ...]}  — листы для объединения.
     Для каждой группы:
-      • определяет хронологический порядок по датам шапки,
-      • BOP берёт из самого старого листа,
-      • обороты суммирует по всем,
-      • EOP рассчитывает по правилу дебет/кредит счёта,
-      • создаёт новый лист с форматированием как у clean_osv_sheet_inplace,
-      • удаляет исходные листы.
+    • определяет хронологический порядок по датам шапки,
+    • BOP берёт из самого старого листа,
+    • обороты суммирует по всем,
+    • EOP рассчитывает по правилу дебет/кредит счёта,
+    • создаёт новый лист с форматированием как у clean_osv_sheet_inplace,
+    • удаляет исходные листы.
     """
     wb = load_workbook(io.BytesIO(file_bytes))
     num_fmt_osv = "#,##0; -#,##0"
@@ -4003,7 +4040,7 @@ def run_code_8_merge_osv(file_bytes: bytes, merge_groups: Dict[str, List[str]]) 
         new_title = make_unique_with_fixed_suffix(wb, common_prefix, account)
 
         ws_new = (wb.create_sheet(new_title, first_idx)
-                  if first_idx is not None else wb.create_sheet(new_title))
+                if first_idx is not None else wb.create_sheet(new_title))
 
         # Шапка
         ws_new.cell(row=1, column=1, value=company_label or f"ОСВ по счёту {account}")
@@ -4043,7 +4080,7 @@ def run_code_8_merge_osv(file_bytes: bytes, merge_groups: Dict[str, List[str]]) 
             ws_new.cell(row=r, column=1).font = font_body
 
             for col, key in [(3, "bop_dt"), (4, "bop_kt"), (5, "turn_dt"),
-                             (6, "turn_kt"), (7, "eop_dt"), (8, "eop_kt")]:
+                            (6, "turn_kt"), (7, "eop_dt"), (8, "eop_kt")]:
                 v = vals[key]
                 cell = ws_new.cell(row=r, column=col, value=v if abs(v) > 1e-9 else None)
                 cell.number_format = num_fmt_osv
@@ -4055,7 +4092,7 @@ def run_code_8_merge_osv(file_bytes: bytes, merge_groups: Dict[str, List[str]]) 
         ws_new.cell(row=ITOGO_ROW, column=1, value="Итого").font = font_hdr
         ws_new.cell(row=ITOGO_ROW, column=1).alignment = align_l
         for col, key in [(3, "bop_dt"), (4, "bop_kt"), (5, "turn_dt"),
-                         (6, "turn_kt"), (7, "eop_dt"), (8, "eop_kt")]:
+                        (6, "turn_kt"), (7, "eop_dt"), (8, "eop_kt")]:
             v = itogo[key]
             cell = ws_new.cell(row=ITOGO_ROW, column=col, value=v if abs(v) > 1e-9 else None)
             cell.number_format = num_fmt_osv
@@ -4128,74 +4165,74 @@ BTN_HOVER = "#1B3A50"
 st.markdown(
     f"""
     <style>
-      #MainMenu {{visibility: hidden;}}
-      footer {{visibility: hidden;}}
-      header {{visibility: hidden;}}
+    #MainMenu {{visibility: hidden;}}
+    footer {{visibility: hidden;}}
+    header {{visibility: hidden;}}
 
-      @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&display=swap');
 
-      .stApp {{
+    .stApp {{
         background: {BG};
         color: {TEXT};
-      }}
+    }}
 
-      html, body, [class*="css"], .stApp {{
+    html, body, [class*="css"], .stApp {{
         font-size: 14px !important;
         font-family: "Consolas", "Courier New", monospace !important;
-      }}
+    }}
 
-      /* Фиксируем Consolas по всей типографике Streamlit/BaseWeb. */
-      button, input, textarea, select, option,
-      label,
-      [data-baseweb],
-      [data-baseweb] *,
-      [data-testid] * {{
+    /* Фиксируем Consolas по всей типографике Streamlit/BaseWeb. */
+    button, input, textarea, select, option,
+    label,
+    [data-baseweb],
+    [data-baseweb] *,
+    [data-testid] * {{
         font-family: "Consolas", "Courier New", monospace !important;
-      }}
+    }}
 
-      .block-container {{
+    .block-container {{
         max-width: 980px;
         padding-top: 1.25rem;
         padding-bottom: 1.25rem;
-      }}
+    }}
 
-      .stMarkdown h4 {{
+    .stMarkdown h4 {{
         font-size: 18px !important;
         margin: 0 0 0.55rem 0 !important;
         color: {TEXT} !important;
         font-weight: 700 !important;
         letter-spacing: 0.2px !important;
         font-family: "Playfair Display", Georgia, serif !important;
-      }}
+    }}
 
-      /* Карточки/контейнеры */
-      [data-testid="stFileUploader"] section,
-      [data-testid="stForm"],
-      .stExpander,
-      [data-testid="stMetric"] {{
+    /* Карточки/контейнеры */
+    [data-testid="stFileUploader"] section,
+    [data-testid="stForm"],
+    .stExpander,
+    [data-testid="stMetric"] {{
         border-radius: 14px !important;
-      }}
+    }}
 
-      [data-testid="stFileUploader"] section {{
+    [data-testid="stFileUploader"] section {{
         padding: 14px;
         border: 1px solid rgba(255,255,255,0.10);
         background: {CARD};
         box-shadow: none;
-      }}
-      [data-testid="stFileUploader"] * {{
+    }}
+    [data-testid="stFileUploader"] * {{
         color: {TEXT} !important;
-      }}
-      [data-testid="stFileUploader"] small {{
+    }}
+    [data-testid="stFileUploader"] small {{
         color: {MUTED} !important;
-      }}
+    }}
 
-      /* Универсальные кнопки (Streamlit / BaseWeb / kind=primary/secondary) */
-      div.stButton > button,
-      div.stDownloadButton > button,
-      button[kind="primary"],
-      button[kind="secondary"],
-      div[data-baseweb="button"] > button,
-      div[data-baseweb="button"] button {{
+    /* Универсальные кнопки (Streamlit / BaseWeb / kind=primary/secondary) */
+    div.stButton > button,
+    div.stDownloadButton > button,
+    button[kind="primary"],
+    button[kind="secondary"],
+    div[data-baseweb="button"] > button,
+    div[data-baseweb="button"] button {{
         background: {BTN_BG} !important;
         color: {BTN_TEXT} !important;
         border: 1px solid {BTN_BORDER} !important;
@@ -4204,102 +4241,102 @@ st.markdown(
         font-weight: 700 !important;
         box-shadow: none !important;
         transition: transform 120ms ease, filter 120ms ease, background-color 120ms ease !important;
-      }}
-      div.stButton > button:hover,
-      div.stDownloadButton > button:hover,
-      button[kind="primary"]:hover,
-      button[kind="secondary"]:hover,
-      div[data-baseweb="button"] > button:hover,
-      div[data-baseweb="button"] button:hover {{
+    }}
+    div.stButton > button:hover,
+    div.stDownloadButton > button:hover,
+    button[kind="primary"]:hover,
+    button[kind="secondary"]:hover,
+    div[data-baseweb="button"] > button:hover,
+    div[data-baseweb="button"] button:hover {{
         background: {BTN_HOVER} !important;
         transform: translateY(-1px) !important;
-      }}
-      div.stButton > button:active,
-      div.stDownloadButton > button:active,
-      button[kind="primary"]:active,
-      button[kind="secondary"]:active,
-      div[data-baseweb="button"] > button:active,
-      div[data-baseweb="button"] button:active {{
+    }}
+    div.stButton > button:active,
+    div.stDownloadButton > button:active,
+    button[kind="primary"]:active,
+    button[kind="secondary"]:active,
+    div[data-baseweb="button"] > button:active,
+    div[data-baseweb="button"] button:active {{
         transform: translateY(0px) !important;
         filter: brightness(0.98) !important;
-      }}
-      div.stButton > button:focus-visible,
-      div.stDownloadButton > button:focus-visible,
-      button[kind="primary"]:focus-visible,
-      button[kind="secondary"]:focus-visible,
-      div[data-baseweb="button"] > button:focus-visible,
-      div[data-baseweb="button"] button:focus-visible {{
+    }}
+    div.stButton > button:focus-visible,
+    div.stDownloadButton > button:focus-visible,
+    button[kind="primary"]:focus-visible,
+    button[kind="secondary"]:focus-visible,
+    div[data-baseweb="button"] > button:focus-visible,
+    div[data-baseweb="button"] button:focus-visible {{
         outline: none !important;
         box-shadow: 0 0 0 3px rgba(173, 214, 255, 0.22) !important;
         border-color: rgba(173, 214, 255, 0.55) !important;
-      }}
+    }}
 
-      /* Uploader: в разных версиях кнопка живёт в dropzone/section */
-      [data-testid="stFileUploader"] button,
-      [data-testid="stFileUploaderDropzone"] button {{
+    /* Uploader: в разных версиях кнопка живёт в dropzone/section */
+    [data-testid="stFileUploader"] button,
+    [data-testid="stFileUploaderDropzone"] button {{
         background: {BTN_BG} !important;
         color: {BTN_TEXT} !important;
         border: 1px solid {BTN_BORDER} !important;
         border-radius: 12px !important;
         font-weight: 700 !important;
-      }}
-      [data-testid="stFileUploader"] button:hover,
-      [data-testid="stFileUploaderDropzone"] button:hover {{
+    }}
+    [data-testid="stFileUploader"] button:hover,
+    [data-testid="stFileUploaderDropzone"] button:hover {{
         background: {BTN_HOVER} !important;
-      }}
+    }}
 
-      [data-testid="stFileUploaderDeleteBtn"] button {{
+    [data-testid="stFileUploaderDeleteBtn"] button {{
         background: rgba(255,255,255,0.06) !important;
         color: {TEXT} !important;
         border: 1px solid {BTN_BORDER} !important;
-      }}
-      [data-testid="stFileUploaderDeleteBtn"] svg {{
+    }}
+    [data-testid="stFileUploaderDeleteBtn"] svg {{
         fill: {TEXT} !important;
         color: {TEXT} !important;
-      }}
+    }}
 
-      input, textarea, [data-baseweb="input"] input {{
+    input, textarea, [data-baseweb="input"] input {{
         background: {CARD} !important;
         color: {TEXT} !important;
         border-color: rgba(255,255,255,0.12) !important;
         border-radius: 12px !important;
-      }}
-      input::placeholder, textarea::placeholder {{
+    }}
+    input::placeholder, textarea::placeholder {{
         color: {MUTED} !important;
-      }}
-      input:focus, textarea:focus, [data-baseweb="input"] input:focus {{
+    }}
+    input:focus, textarea:focus, [data-baseweb="input"] input:focus {{
         outline: none !important;
         box-shadow: 0 0 0 3px rgba(173, 214, 255, 0.24) !important;
         border-color: rgba(173, 214, 255, 0.55) !important;
-      }}
+    }}
 
-      /* Ширина для основных action-кнопок */
-      div.stButton > button, div.stDownloadButton > button {{
+    /* Ширина для основных action-кнопок */
+    div.stButton > button, div.stDownloadButton > button {{
         width: 100%;
         font-size: 16px !important;
-      }}
+    }}
 
-      .stMarkdown, .stMarkdown p, .stCaption, label {{
+    .stMarkdown, .stMarkdown p, .stCaption, label {{
         color: {TEXT} !important;
-      }}
-      .stCaption {{
+    }}
+    .stCaption {{
         color: {MUTED} !important;
-      }}
+    }}
 
-      /* Чекбоксы/радио */
-      [data-testid="stCheckbox"] * {{
+    /* Чекбоксы/радио */
+    [data-testid="stCheckbox"] * {{
         color: {TEXT} !important;
-      }}
-      input[type="checkbox"], input[type="radio"] {{
+    }}
+    input[type="checkbox"], input[type="radio"] {{
         accent-color: {ACCENT} !important;
-      }}
+    }}
 
-      /* Алерты */
-      [data-testid="stAlert"] {{
+    /* Алерты */
+    [data-testid="stAlert"] {{
         border-radius: 14px !important;
         border: 1px solid rgba(255,255,255,0.10) !important;
         box-shadow: none !important;
-      }}
+    }}
     </style>
     """,
     unsafe_allow_html=True,
