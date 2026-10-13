@@ -14,6 +14,344 @@ import requests as _requests_lib
 import pandas as pd
 import streamlit as st
 
+# ── egov / ГБД ЮЛ ─────────────────────────────────────────────────────────
+_EGOV_API_KEY = "ef214eb1c5684c86a7991c91caa93f5b"
+_EGOV_BASE    = "https://data.egov.kz"
+_egov_session = _requests_lib.Session()
+_egov_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
+    "Referer": _EGOV_BASE,
+})
+_egov_session.cookies.update({
+    "cookiesession1": "678B769B1B988DB877C03DCFCF48FEF4",
+    "egovLang": "ru",
+})
+_egov_cache: Dict[str, dict] = {}
+
+# Организационно-правовые формы для классификации
+_RU_FORMS  = {'ООО','ОАО','ЗАО','ПАО','НАО','ФГУП','МУП','ГУП','АНО','НКО','АООТ','АОЗТ','ООО.','ОАО.'}
+# LLC и LLP убраны — широко используются и KZ-компаниями (ТОО в англ. написании)
+_FOR_FORMS = {'LTD','GMBH','INC','CORP','BV','AG','SAS','NV','AB','OY','SARL','LTD.','CO.'}
+_KZ_FORMS  = {'ТОО','АО','РГП','ГКП','ТДО','ПК','АКБ','БРК','НАО','ГУ','КГП','ТК','ГП','ЧК','КФХ','СПК','МКО','МФО','НПФ','РГУ','КГУ'}
+# Иностранные формы из стран СНГ (не KZ)
+_FOR_FORMS.update({'ТОВ','ОАТ','ПАТ','ПРАТ','ФОП','ОДО','ЧТУП','ЧУП','ТЧУП','РУП'})
+# ХХК — монгольская форма (Хязгаарлагдмал Хариуцлагатай Компани)
+_FOR_FORMS.add('ХХК')
+
+# Полные русские названия форм для обогащения поискового запроса (улучшает ранжирование в ES)
+_KZ_FORM_FULL = {
+    'ТОО': 'Товарищество с ограниченной ответственностью',
+    'АО':  'Акционерное общество',
+    'НАО': 'Некоммерческое акционерное общество',
+    'ПК':  'Производственный кооператив',
+    'РГП': 'Республиканское государственное предприятие',
+    'ГП':  'Государственное предприятие',
+    'ГУ':  'Государственное учреждение',
+    'КГП': 'Коммунальное государственное предприятие',
+    'ГКП': 'Государственное коммунальное предприятие',
+    'ТДО': 'Товарищество с дополнительной ответственностью',
+    'КФХ': 'Крестьянское фермерское хозяйство',
+    'СПК': 'Сельскохозяйственный производственный кооператив',
+    'МКО': 'Микрокредитная организация',
+    'МФО': 'Микрофинансовая организация',
+    'НПФ': 'Накопительный пенсионный фонд',
+    'АКБ': 'Акционерный коммерческий банк',
+    'РГУ': 'Республиканское государственное учреждение',
+    'КГУ': 'Коммунальное государственное учреждение',
+}
+
+# Полные русские/казахские названия KZ организационно-правовых форм
+_KZ_FULL_RE = re.compile(
+    r'\bтоварищество\s+с\s+ограниченн'          # ТОО полная форма (с опечатками тоже)
+    r'|\bтоварищество\s+с\s+дополнительной\s+ответственностью\b'
+    r'|\bакционерное\s+общество\b'
+    r'|\bнекоммерческое\s+акционерное\s+общество\b'
+    r'|\bпроизводственный\s+кооператив\b'
+    r'|\bполное\s+товарищество\b'
+    r'|\bкоммандитное\s+товарищество\b'
+    r'|\bобщественное\s+объединение\b'
+    r'|\bобщественный\s+(?:благотворительный\s+)?фонд\b'
+    r'|\bучреждение\b'
+    r'|\bфилиал\b'
+    r'|\bпредставительство\b'
+    r'|\bгосударственное\s+(?:казенное\s+)?предприятие\b'
+    r'|\bреспубликанское\s+государственное\s+предприятие\b'
+    r'|\bчастная\s+компания\b',
+    re.IGNORECASE,
+)
+
+# Весь кириллический блок Unicode U+0400-U+04FF — покрывает все буквы
+# казахского алфавита включая Ħ/ħ (U+04BA/04BB), Ö/ö (U+04E8/04E9) и др.
+_CYR = r'Ѐ-ӿ'
+
+# ФИО: Фамилия Имя Отчество (патроним — обязателен для детекции)
+_FIO_RE = re.compile(
+    rf'^[{_CYR}][{_CYR}\-]+'
+    rf'\s+[{_CYR}][{_CYR}\-]+'
+    rf'\s+[{_CYR}][{_CYR}]*'
+    r'(?:ович|евич|овна|евна|ьевич|ьевна|ынич|иевич|иевна|вич|вна'
+    r'|улы|ұлы|кызы|қызы|уғли|ўғли)\s*$',
+    re.IGNORECASE,
+)
+# ФИО с инициалами: "Юсупов Т.Т." / "Иванов А."
+_FIO_INITIALS_RE = re.compile(
+    rf'^[{_CYR}][{_CYR}\-]+'
+    rf'\s+[{_CYR}A-Z]\.(?:[{_CYR}A-Z]\.)?\s*$',
+)
+# Патроним как первое слово: "АЛТЫНБЕКҰЛЫ МҰҚАН" (обратный порядок)
+_FIO_REV_RE = re.compile(
+    rf'^[{_CYR}][{_CYR}\-]*'
+    r'(?:ұлы|улы|қызы|кызы|уғли|ўғли)'
+    rf'\s+[{_CYR}][{_CYR}\-]*\s*$',
+    re.IGNORECASE,
+)
+
+# Внутренние учётные позиции — не контрагенты
+_INTERNAL_RE = re.compile(
+    r'^(?:основн\w*\s+касс\w+'
+    r'|основн\w*\s+счёт\b|основн\w*\s+счет\b'
+    r'|корпоратив\w*\s+карточ\w+'
+    r'|курсовые\s+разниц\w+'
+    r'|комиссия\s+банк\w*'
+    r'|расчет[нь]?[ыо][йе]?\s+счет|расчёт[нь]?[ыо][йе]?\s+счёт'
+    r'|депозит\s+договор'
+    r'|прочи[ех]?\s+(?:расход|выплат|затрат|поступлени|операци|доход)\w*'
+    r'|доход\w*\s+по\s+вознаграждени\w*'
+    r'|(?:прочи[ех]?\s+)?(?:финансов\w+\s+)?(?:расход|выплат)\w*\s+(?:по|за)\s+\w+)',
+    re.IGNORECASE,
+)
+
+# Паттерны физлиц и заглушек — поиск не нужен
+_PHYS_PATTERNS = [
+    (r'физ\.?\s*лиц',               'Физическое лицо'),
+    (r'физическое\s+лицо',          'Физическое лицо'),
+    (r'частное\s+лиц',              'Физическое лицо'),
+    (r'частн\.?\s*лиц',             'Физическое лицо'),
+    (r'^частное$',                  'Физическое лицо'),
+]
+_SKIP_RE = re.compile(
+    r'^[\s\-–—\.,:;/\\0-9]+$'                   # пусто / только спецсимволы / только цифры
+    r'|^(?:н/?д|нет\s+данных?|не\s+определ|прочи[ех]?|разные?|итого|прочее)$',
+    re.IGNORECASE,
+)
+
+def _egov_v4(dataset: str, source: dict) -> list:
+    import json as _json
+    try:
+        r = _egov_session.get(
+            f"{_EGOV_BASE}/api/v4/{dataset}/v1",
+            params={"apiKey": _EGOV_API_KEY, "source": _json.dumps(source, ensure_ascii=False)},
+            timeout=10,
+        )
+        return r.json() if r.ok else []
+    except Exception:
+        return []
+
+def _egov_classify(name: str) -> Tuple[str, str]:
+    """
+    Классифицирует название контрагента.
+    Возвращает (тип, поисковый запрос):
+      'kz_ul'   — казахстанское юрлицо → поиск в gbd_ul
+      'kz_ip'   — ИП (физлицо) → нет в ГБД ЮЛ
+      'russian' — российская форма (ООО/ОАО/ЗАО…) → поиск не нужен
+      'foreign' — иностранная форма (LLC/Ltd…) → поиск не нужен
+    """
+    up = name.upper().strip()
+
+    # 1. Пустые и заглушки — не ищем
+    if not name.strip() or _SKIP_RE.match(name.strip()):
+        return ('skip', '')
+
+    # 1а. IBAN / номер счёта (KZxx... или любой IBAN-формат: 2 буквы + 2 цифры)
+    if re.match(r'^[A-Z]{2}\d{2}[A-Z0-9]', up):
+        return ('bank_account', '')
+
+    # 2. Внутренние учётные записи (Основная касса, Основной счёт и т.п.)
+    if _INTERNAL_RE.match(name.strip()):
+        return ('internal', '')
+
+    # 3. Физические лица
+    for pattern, _ in _PHYS_PATTERNS:
+        if re.search(pattern, name, flags=re.IGNORECASE):
+            return ('phys', '')
+    # ФИО: Фамилия Имя Отчество (патроним последним)
+    if _FIO_RE.match(name.strip()):
+        return ('phys', '')
+    # ФИО: Патроним(ұлы/қызы) Имя (патроним первым — АЛТЫНБЕКҰЛЫ МҰҚАН)
+    if _FIO_REV_RE.match(name.strip()):
+        return ('phys', '')
+    # ФИО с инициалами: "Юсупов Т.Т." / "Иванов А."
+    if _FIO_INITIALS_RE.match(name.strip()):
+        return ('phys', '')
+
+    # 4. ИП и аналоги — проверяем до всего остального
+    _ip_markers = (
+        r'ИНДИВИДУАЛЬНЫЙ\s+ПРЕДПРИНИМАТЕЛЬ',
+        r'ЧАСТНЫЙ\s+ПРЕДПРИНИМАТЕЛЬ',
+        r'ЧАСТНЫЙ\s+ПРЕДП',
+    )
+    _ip_abbr = r'(?:^|[\s«"\(\.])(?:ИП|ЧП|ФОП)(?:$|[\s»"\)\.])'
+    if (any(re.search(p, up) for p in _ip_markers)
+            or re.search(_ip_abbr, up)
+            or up.startswith('ИП ') or up.startswith('ИП«') or up.startswith('ИП"')
+            or up.startswith('ЧП ') or up.startswith('ФОП ')):
+        clean = name
+        for p in _ip_markers:
+            clean = re.sub(p, '', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'(?:^|[\s«"\(\.])(?:ИП|ЧП|ФОП)(?:$|[\s»"\)\.])', ' ', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\s*\(.*?\)\s*', ' ', clean).strip('«»"\' ()-').strip()
+        return ('kz_ip', clean)
+
+    # Убираем скобочные пояснения для поиска: "АО АРВИАЙ (РАШЕН ВЕНЧУР)" → "АО АРВИАЙ"
+    core = re.sub(r'\s*\(.*?\)\s*', ' ', name).strip()
+
+    # KZ юрлицо — проверяем ДО иностранных форм (ЧК/ТОО выигрывают у Ltd.)
+    _Q_RE = re.compile(r'[«"""„]([^«"""»""]{2,})[»""""]')
+    for f in _KZ_FORMS:
+        if re.search(r'(?:^|[\s"«\.])' + re.escape(f) + r'(?:$|[\s"»\.\,])', up):
+            # Если есть кавычки — берём имя оттуда: 'Специализированное "Кузет" АО' → 'Кузет'
+            m_q = _Q_RE.search(name)
+            if m_q:
+                name_part = m_q.group(1).strip()
+            else:
+                name_part = re.sub(r'(?:^|[\s"«\.])' + re.escape(f) + r'(?:$|[\s"»\.\,])', ' ', core, flags=re.IGNORECASE)
+                name_part = name_part.strip('«»"\' -.').strip()
+            full_form = _KZ_FORM_FULL.get(f, '')
+            query = f"{full_form} {name_part}".strip() if full_form and name_part else (name_part or core)
+            return ('kz_ul', query)
+
+    # Полные русские названия KZ форм (Товарищество с ограниченной..., Филиал, Учреждение...)
+    if _KZ_FULL_RE.search(name):
+        # Приоритет: содержимое кавычек («…», "…", "…")
+        m = re.search(r'[«"""„]([^«"""»""]+)[»""""]', name)
+        if m:
+            query = m.group(1).strip()
+        elif re.search(r'\bфилиал\b|\bпредставительство\b', name, re.IGNORECASE):
+            # Нет кавычек — убираем "Филиал/Представительство" и "в РК/в Республике Казахстан"
+            query = re.sub(r'\bфилиал\b|\bпредставительство\b', ' ', name, flags=re.IGNORECASE)
+            query = re.sub(r'\s*в\s+(?:Республике\s+Казахстан|РК)\s*', ' ', query, flags=re.IGNORECASE)
+            query = query.strip('«»"\' -.').strip()
+        else:
+            query = _KZ_FULL_RE.sub(' ', core).strip('«»"\' -.').strip()
+        return ('kz_ul', query or core)
+
+    # Проверяем российские формы
+    for f in _RU_FORMS:
+        if re.search(r'(?:^|[\s"«])' + re.escape(f) + r'(?:$|[\s"»\.])', up):
+            return ('russian', '')
+
+    # Проверяем иностранные формы
+    for f in _FOR_FORMS:
+        if re.search(r'\b' + re.escape(f) + r'\b', up):
+            return ('foreign', core)  # передаём имя — иностр. компании могут иметь КЗ БИН
+
+    # Форма не распознана — пробуем как KZ юрлицо с исходным именем
+    return ('kz_ul', core)
+
+def _egov_confidence(query: str, result_name: str) -> bool:
+    """True если ВСЕ ключевые слова запроса присутствуют в результате."""
+    skip = {'товарищество','ограниченной','ответственностью','дополнительной',
+            'акционерное','общество','некоммерческое',
+            'государственное','республиканское','коммунальное','муниципальное',
+            'предприятие','учреждение','производственный','кооператив',
+            'сельскохозяйственный','крестьянское','фермерское','хозяйство',
+            'накопительный','пенсионный','микрокредитная','микрофинансовая','организация',
+            'компания','группа','объединение','холдинг','корпорация','фонд'}
+    # Для слов с одновременно кириллическими и латинскими буквами
+    # заменяем визуально схожие кирилл. символы на латинские (например «С»→C, «о»→o).
+    # Применяем ТОЛЬКО к смешанным словам, иначе "товарищество"→"tobapищество"
+    # и оно не попадёт в skip-список.
+    _homoglyph_tbl = str.maketrans('СсАаЕеОоРрХхКкТтМмВв', 'CcAaEeOoPpXxKkTtMmBb')
+    def _norm_word(w: str) -> str:
+        has_cyr = any('Ѐ' <= c <= 'ӿ' for c in w)
+        has_lat = any('A' <= c <= 'Z' or 'a' <= c <= 'z' for c in w)
+        return w.translate(_homoglyph_tbl) if (has_cyr and has_lat) else w
+    # [^\W\d_] — любая Unicode-буква (не цифра, не _), покрывает казахские Ø/ø, Ħ/ħ и др.
+    _kw_re = re.compile(r'[^\W\d_]{3,}', re.UNICODE)
+    def keywords(s: str) -> set:
+        return {_norm_word(w).lower() for w in _kw_re.findall(s)
+                if _norm_word(w).lower() not in skip}
+    q_kw = keywords(query)
+    r_kw = keywords(result_name)
+    if not q_kw:
+        return True
+    # Если запрос на латинице, а результат на кириллице (транслитерация) — доверяем ES
+    def _is_latin(w): return all(ord(c) < 0x400 for c in w)
+    def _is_cyr(w):   return all(0x400 <= ord(c) <= 0x4FF for c in w)
+    if q_kw and r_kw and all(_is_latin(w) for w in q_kw) and all(_is_cyr(w) for w in r_kw):
+        return True
+    return q_kw <= r_kw
+
+def _egov_company_summary(name: str) -> dict:
+    if name in _egov_cache:
+        return _egov_cache[name]
+
+    kind, query = _egov_classify(name)
+
+    if kind == 'skip':
+        result = {"found": False, "note": "Пропущено (пустое/служебное значение)"}
+    elif kind == 'bank_account':
+        result = {"found": False, "note": "Банковский счёт (IBAN)"}
+    elif kind == 'internal':
+        result = {"found": False, "note": "Внутренняя позиция"}
+    elif kind == 'phys':
+        result = {"found": False, "note": "Физическое лицо"}
+    elif kind == 'russian':
+        result = {"found": False, "note": "Иностранная организация (РФ)"}
+    elif kind == 'foreign':
+        # Иностранные компании могут быть зарегистрированы в КЗ и иметь БИН
+        if len(query.strip()) >= 3:
+            rows = _egov_v4("gbd_ul", {
+                "query": {"query_string": {"query": query, "fields": ["nameru"]}},
+                "size": 5,
+            })
+            if rows:
+                c = rows[0]
+                confident = _egov_confidence(query, c.get("nameru", ""))
+                bin_val = c.get("bin", "")
+                result = {
+                    "found":   confident,
+                    "nameru":  c.get("nameru", ""),
+                    "bin":     bin_val,
+                    "regdate": c.get("regdate", ""),
+                    "director": c.get("director", ""),
+                    "note":    "" if confident else "Иностранная организация (БИН не подтверждён)",
+                }
+            else:
+                result = {"found": False, "note": "Иностранная организация"}
+        else:
+            result = {"found": False, "note": "Иностранная организация"}
+    elif kind == 'kz_ip':
+        result = {"found": False, "note": "ИП / ЧП — нет в ГБД ЮЛ"}
+    else:
+        # kz_ul — ищем в ГБД ЮЛ
+        if len(query.strip()) < 3:
+            result = {"found": False, "note": "Слишком короткий запрос"}
+        else:
+            rows = _egov_v4("gbd_ul", {
+                "query": {"query_string": {"query": query, "fields": ["nameru"]}},
+                "size": 5,
+            })
+            if not rows:
+                result = {"found": False, "note": "Не найдено в ГБД ЮЛ"}
+            else:
+                c = rows[0]
+                confident = _egov_confidence(query, c.get("nameru", ""))
+                bin_val = c.get("bin", "")
+                result = {
+                    "found":   confident,
+                    "nameru":  c.get("nameru", ""),
+                    "bin":     bin_val,
+                    "director": c.get("director", ""),
+                    "datereg":  c.get("datereg", ""),
+                    "note":     "" if confident else "Возможно неверное совпадение",
+                }
+                if not confident:
+                    result["found"] = False
+
+    _egov_cache[name] = result
+    return result
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
@@ -1108,6 +1446,10 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
 
     group_osv_ok = bool(valid_group_osv)
 
+    # Контрагенты (egov): листы, заканчивающиеся на "wt" (регистр не важен)
+    wt_sheets = [sh for sh in wb.sheetnames if sh.strip().lower().endswith("wt")]
+    clients_ok = bool(wt_sheets)
+
     return {
         "inventory_accounts_found": inventory_accounts_found,
         "saldo_ok": saldo_ok,
@@ -1124,6 +1466,8 @@ def compute_availability_from_wb(wb) -> Dict[str, object]:
         "gos_sheets": gos_sheets,
         "group_osv_ok": group_osv_ok,
         "valid_group_osv": valid_group_osv,
+        "clients_ok": clients_ok,
+        "wt_sheets": wt_sheets,
     }
 
 
@@ -2378,7 +2722,20 @@ def run_code_1(file_bytes: bytes) -> bytes:
 
     out = io.BytesIO()
     wb.save(out)
-    return out.getvalue()
+
+    # Топ-5 заказчиков по дебиторке (для проверки через egov)
+    top5: list = []
+    try:
+        if not df_cust.empty and "сальдо заказчики" in df_cust.columns:
+            top5 = (
+                df_cust[df_cust["сальдо заказчики"] > 0]
+                .nlargest(5, "сальдо заказчики")["Контрагент"]
+                .tolist()
+            )
+    except Exception:
+        pass
+
+    return out.getvalue(), top5
 
 
 # =========================
@@ -4144,7 +4501,203 @@ def run_code_8_merge_osv(file_bytes: bytes, merge_groups: Dict[str, List[str]]) 
 
 
 # =========================
-# ?????? ? ????
+# EGOV — вспомогательные функции
+# =========================
+def find_wt_sheets(file_bytes: bytes) -> List[str]:
+    """Возвращает имена листов, которые заканчиваются на 'wt' (регистр не важен)."""
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), read_only=True)
+        result = [s for s in wb.sheetnames if s.strip().lower().endswith("wt")]
+        wb.close()
+        return result
+    except Exception:
+        return []
+
+
+def read_wt_all_counterparties(file_bytes: bytes, sheet_name: str) -> List[Tuple[str, str]]:
+    """
+    Читает все таблицы с листа wt.
+    Возвращает список (имя_таблицы, название_контрагента).
+
+    Структура листа wt:
+      - Строка-заголовок таблицы (col B)
+      - Строки с контрагентами (col B)
+      - "Топ" — маркер конца, не включаем
+      - "Всего", "Доля" — служебные строки, пропускаем
+      - Пустые строки — разделители
+
+    Пропускаем таблицы, содержащие "Inflow" или "Outflow" в названии
+    (они дубликаты Прочая_ДЗ/КЗ).
+    """
+    _SUMMARY = {'топ', 'всего', 'доля'}
+    _SKIP_TBL = re.compile(r'inflow|outflow', re.IGNORECASE)
+    _SKIP_VAL = re.compile(
+        r'^[\s\-–—\.,:;/\\0-9]+$'
+        r'|^(?:н/?д|нет\s+данных?|не\s+определ|прочи[ех]?|разные?|итого)$',
+        re.IGNORECASE,
+    )
+    results: List[Tuple[str, str]] = []
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        ws = wb[sheet_name]
+        current_table: Optional[str] = None
+        in_table: bool = False
+        for row in ws.iter_rows(min_col=2, max_col=2, values_only=True):
+            raw = row[0]
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if not s:
+                continue
+            s_low = s.lower()
+            if s_low in _SUMMARY:
+                if s_low == 'топ':
+                    in_table = False
+                    current_table = None
+                continue
+            if not in_table:
+                current_table = s
+                in_table = True
+            else:
+                if current_table and _SKIP_TBL.search(current_table):
+                    continue
+                if _SKIP_VAL.match(s):
+                    continue
+                if current_table:
+                    results.append((current_table, s))
+        wb.close()
+    except Exception:
+        pass
+    return results
+
+
+def run_egov_clients_sheet(file_bytes: bytes, wt_sheets: List[str]) -> bytes:
+    """
+    Для каждого листа из wt_sheets читает все таблицы контрагентов,
+    делает lookup через egov, создаёт/обновляет лист 'контрагенты'.
+    Если листов >1 — добавляет столбец 'Компания' (из w-листа, ячейка B2).
+    Всегда добавляет столбец 'Таблица' (откуда взят контрагент на листе wt).
+    """
+    wb = load_workbook(io.BytesIO(file_bytes))
+    multi = len(wt_sheets) > 1
+
+    def _company_name(wt_sh: str) -> str:
+        prefix, _ = split_prefix_suffix2(wt_sh)
+        target = (prefix + "w").lower()
+        for sh in wb.sheetnames:
+            if sh.lower() == target:
+                try:
+                    val = wb[sh].cell(row=2, column=2).value
+                    return str(val).strip() if val else wt_sh
+                except Exception:
+                    pass
+        return wt_sh
+
+    # Собираем все строки: (company, table_name, counterparty_name)
+    all_rows: List[Tuple[str, str, str]] = []
+    for wt_sh in wt_sheets:
+        company = _company_name(wt_sh) if multi else ""
+        pairs = read_wt_all_counterparties(file_bytes, wt_sh)
+        for tbl_name, cp_name in pairs:
+            all_rows.append((company, tbl_name, cp_name))
+
+    if not all_rows:
+        return file_bytes
+
+    for _dead in ("контрагенты", "клиенты"):
+        if _dead in wb.sheetnames:
+            del wb[_dead]
+    ws_k = wb.create_sheet("контрагенты")
+
+    # --- Стили ---
+    hdr_font  = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+    hdr_fill  = PatternFill("solid", fgColor="1A1A1A")
+    cell_font = Font(name="Calibri", size=10)
+    muted_font = Font(name="Calibri", size=10, color="888888", italic=True)
+    thin      = Side(border_style="thin", color="333333")
+    border    = Border(left=thin, right=thin, top=thin, bottom=thin)
+    align_c   = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    align_l   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    if multi:
+        headers = [
+            ("Компания",                26),
+            ("Таблица",                 18),
+            ("Контрагент (wt)",         30),
+            ("Полное название (ГБД ЮЛ)", 44),
+            ("БИН",                     14),
+            ("Дата регистрации",        16),
+            ("Директор",                34),
+        ]
+        COL_COMPANY  = 1
+        COL_TABLE    = 2
+        COL_CONTR    = 3
+        COL_FULLNAME = 4
+        COL_BIN      = 5
+        COL_DATE     = 6
+        COL_DIRECTOR = 7
+    else:
+        headers = [
+            ("Таблица",                 18),
+            ("Контрагент (wt)",         30),
+            ("Полное название (ГБД ЮЛ)", 44),
+            ("БИН",                     14),
+            ("Дата регистрации",        16),
+            ("Директор",                34),
+        ]
+        COL_COMPANY  = 0   # нет
+        COL_TABLE    = 1
+        COL_CONTR    = 2
+        COL_FULLNAME = 3
+        COL_BIN      = 4
+        COL_DATE     = 5
+        COL_DIRECTOR = 6
+
+    for ci, (h, w) in enumerate(headers, 1):
+        cell = ws_k.cell(row=1, column=ci, value=h)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.border = border
+        cell.alignment = align_c
+        ws_k.column_dimensions[get_column_letter(ci)].width = w
+    ws_k.row_dimensions[1].height = 18
+
+    left_cols = {c for c in (COL_COMPANY, COL_TABLE, COL_CONTR, COL_FULLNAME, COL_DIRECTOR) if c}
+
+    for ri, (company, tbl_name, name) in enumerate(all_rows, 2):
+        info = _egov_company_summary(name)
+        ws_k.row_dimensions[ri].height = 16
+
+        def _c(col: int, val, fnt=None, _ri=ri):
+            cell = ws_k.cell(row=_ri, column=col, value=val)
+            cell.font = fnt or cell_font
+            cell.border = border
+            cell.alignment = align_l if col in left_cols else align_c
+            return cell
+
+        if COL_COMPANY:
+            _c(COL_COMPANY, company)
+        _c(COL_TABLE,  tbl_name)
+        _c(COL_CONTR,  name)
+
+        if info.get("found"):
+            _c(COL_FULLNAME, info.get("nameru", ""))
+            _c(COL_BIN,      info.get("bin", ""))
+            _c(COL_DATE,     info.get("datereg", ""))
+            _c(COL_DIRECTOR, info.get("director", ""))
+        else:
+            note = info.get("note") or "Не найдено в ГБД ЮЛ"
+            _c(COL_FULLNAME, note, muted_font)
+
+    ws_k.freeze_panes = "A2"
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# =========================
+# Streamlit UI
 # =========================
 st.set_page_config(page_title="TERMINAL", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
@@ -4632,6 +5185,8 @@ if "prepared_bytes" in st.session_state:
     gos_sheets = availability.get("gos_sheets") or []
     group_osv_ok = bool(availability.get("group_osv_ok"))
     valid_group_osv: Dict[str, List[str]] = availability.get("valid_group_osv") or {}
+    clients_ok = bool(availability.get("clients_ok"))
+    wt_sheets_avail: List[str] = availability.get("wt_sheets") or []
 
     opt_profit = st.checkbox("Чистая прибыль", value=False, disabled=(not profit_ok))
     if not profit_ok:
@@ -4674,6 +5229,24 @@ if "prepared_bytes" in st.session_state:
     opt_saldo = st.checkbox("Сальдо", value=False, disabled=(not saldo_ok))
     if not saldo_ok:
         st.caption("Сальдо недоступно: не найдены листы, заканчивающиеся на 1210/1710/3310/3510.")
+
+    opt_clients = st.checkbox("Контрагенты", value=False, disabled=(not clients_ok))
+    if not clients_ok:
+        st.caption("Контрагенты недоступны: не найден лист wt.")
+    selected_wt_sheets: List[str] = []
+    if opt_clients and wt_sheets_avail:
+        if len(wt_sheets_avail) == 1:
+            selected_wt_sheets = wt_sheets_avail[:]
+            st.caption(f"Источник: лист **{wt_sheets_avail[0]}**")
+        else:
+            st.caption("Выберите листы wt для обработки:")
+            for _wsh in wt_sheets_avail:
+                _pad, _col1 = st.columns([1, 6])
+                with _pad:
+                    st.write("")
+                with _col1:
+                    if st.checkbox(_wsh, value=False, key=f"wt_pick::{_wsh}"):
+                        selected_wt_sheets.append(_wsh)
 
     inv_available_any = bool(inv_accounts_found)
     opt_inventory = st.checkbox("Запасы", value=False, disabled=(not inv_available_any))
@@ -4797,10 +5370,13 @@ if "prepared_bytes" in st.session_state:
         selected_modes.append("Сальдо")
     if opt_contracts:
         selected_modes.append("Контракты")
+    if opt_clients and selected_wt_sheets:
+        selected_modes.append("Контрагенты")
 
     st.write("")
     st.markdown("#### Запуск")
 
+    clients_sel_ok = (not opt_clients) or bool(selected_wt_sheets)
     has_any_mode = (bool(selected_modes) or opt_inventory or opt_profit or opt_insights
                     or opt_gos or (opt_group_osv and bool(selected_groups))
                     or (opt_merge_osv and bool(selected_merge_osv)))
@@ -4812,6 +5388,7 @@ if "prepared_bytes" in st.session_state:
     run_btn = st.button("Обработать", disabled=(
         (not has_any_mode) or (not inventory_ok) or (not profit_sel_ok)
         or (not gos_sel_ok) or (not group_osv_sel_ok) or (not merge_osv_sel_ok)
+        or (not clients_sel_ok)
     ))
 
     status_box = st.empty()
@@ -4840,7 +5417,8 @@ if "prepared_bytes" in st.session_state:
             if "Сальдо" in selected_modes:
                 status_box.info("Обработка: Сальдо…")
                 progress.progress(65)
-                out_bytes = run_code_1(out_bytes)
+                out_bytes, _top5 = run_code_1(out_bytes)
+                st.session_state["top5_customers"] = _top5
                 progress.progress(78)
 
             if opt_inventory:
@@ -4876,6 +5454,11 @@ if "prepared_bytes" in st.session_state:
                 status_box.info("Обработка: объединение ОСВ по счёту…")
                 progress.progress(99)
                 out_bytes = run_code_8_merge_osv(out_bytes, selected_merge_osv)
+
+            if "Контрагенты" in selected_modes and selected_wt_sheets:
+                status_box.info("Обработка: Контрагенты (запросы к ГБД ЮЛ, может занять время)…")
+                progress.progress(99)
+                out_bytes = run_egov_clients_sheet(out_bytes, selected_wt_sheets)
 
             st.session_state["processed_bytes"] = out_bytes
             st.session_state["processed_name"] = st.session_state.get("prepared_name") or "output.xlsx"
@@ -4922,4 +5505,5 @@ if "prepared_bytes" in st.session_state:
             mime=download_mime,
             use_container_width=True,
         )
-    
+
+
