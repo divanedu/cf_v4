@@ -4146,21 +4146,20 @@ def run_code_8_merge_osv(file_bytes: bytes, merge_groups: Dict[str, List[str]]) 
 # =========================
 # ?????? ? ????
 # =========================
-st.set_page_config(page_title="", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="TERMINAL", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
-# Тема (современный dark UI)
-BG = "#101824"          # фон
-BG_2 = "#101824"        # без градиента
-TEXT = "#E9EEF5"        # основной текст
-MUTED = "#A7B3C4"       # подписи/вторичный текст
-CARD = "#0F1722"        # карточки/поля
-BORDER = "#223042"      # границы
-ACCENT = "#ADD6FF"      # акцент (чекбоксы/фокус)
-ACCENT_2 = "#2EE9A6"    # второй акцент (для подсветок)
-BTN_BG = "#163042"      # кнопки (тёмный сине-серый)
-BTN_TEXT = TEXT         # текст кнопок (светлый)
-BTN_BORDER = "rgba(255,255,255,0.12)"
-BTN_HOVER = "#1B3A50"
+# Bloomberg Terminal theme
+BG     = "#000000"
+CARD   = "#0A0A0A"
+TEXT   = "#E8E8E8"
+MUTED  = "#888888"
+ACCENT = "#FF6600"       # Bloomberg orange
+ACCENT_2 = "#FFB347"     # amber highlight
+BORDER = "#2A2A2A"
+BTN_BG    = "#1A1A1A"
+BTN_TEXT  = ACCENT
+BTN_BORDER = "#FF6600"
+BTN_HOVER  = "#2A2A2A"
 
 st.markdown(
     f"""
@@ -4169,19 +4168,16 @@ st.markdown(
     footer {{visibility: hidden;}}
     header {{visibility: hidden;}}
 
-    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&display=swap');
-
     .stApp {{
         background: {BG};
         color: {TEXT};
     }}
 
     html, body, [class*="css"], .stApp {{
-        font-size: 14px !important;
+        font-size: 13px !important;
         font-family: "Consolas", "Courier New", monospace !important;
     }}
 
-    /* Фиксируем Consolas по всей типографике Streamlit/BaseWeb. */
     button, input, textarea, select, option,
     label,
     [data-baseweb],
@@ -4191,31 +4187,34 @@ st.markdown(
     }}
 
     .block-container {{
-        max-width: 980px;
-        padding-top: 1.25rem;
-        padding-bottom: 1.25rem;
+        max-width: 1100px;
+        padding-top: 1rem;
+        padding-bottom: 1rem;
     }}
 
+    /* Заголовки секций — оранжевая левая полоса */
     .stMarkdown h4 {{
-        font-size: 18px !important;
-        margin: 0 0 0.55rem 0 !important;
-        color: {TEXT} !important;
+        font-size: 11px !important;
         font-weight: 700 !important;
-        letter-spacing: 0.2px !important;
-        font-family: "Playfair Display", Georgia, serif !important;
+        letter-spacing: 1.5px !important;
+        text-transform: uppercase !important;
+        color: {ACCENT} !important;
+        font-family: "Consolas", "Courier New", monospace !important;
+        border-left: 3px solid {ACCENT};
+        padding-left: 8px;
+        margin: 0.8rem 0 0.5rem 0 !important;
     }}
 
-    /* Карточки/контейнеры */
+    /* File uploader */
     [data-testid="stFileUploader"] section,
     [data-testid="stForm"],
-    .stExpander,
-    [data-testid="stMetric"] {{
-        border-radius: 14px !important;
+    .stExpander {{
+        border-radius: 0 !important;
+        border: 1px solid {BORDER} !important;
     }}
 
     [data-testid="stFileUploader"] section {{
-        padding: 14px;
-        border: 1px solid rgba(255,255,255,0.10);
+        padding: 12px;
         background: {CARD};
         box-shadow: none;
     }}
@@ -4226,7 +4225,7 @@ st.markdown(
         color: {MUTED} !important;
     }}
 
-    /* Универсальные кнопки (Streamlit / BaseWeb / kind=primary/secondary) */
+    /* Кнопки */
     div.stButton > button,
     div.stDownloadButton > button,
     button[kind="primary"],
@@ -4236,11 +4235,13 @@ st.markdown(
         background: {BTN_BG} !important;
         color: {BTN_TEXT} !important;
         border: 1px solid {BTN_BORDER} !important;
-        border-radius: 12px !important;
-        padding: 0.60rem 0.90rem !important;
+        border-radius: 0 !important;
+        padding: 0.55rem 0.90rem !important;
         font-weight: 700 !important;
+        letter-spacing: 1px !important;
+        text-transform: uppercase !important;
         box-shadow: none !important;
-        transition: transform 120ms ease, filter 120ms ease, background-color 120ms ease !important;
+        transition: background 100ms ease !important;
     }}
     div.stButton > button:hover,
     div.stDownloadButton > button:hover,
@@ -4248,82 +4249,70 @@ st.markdown(
     button[kind="secondary"]:hover,
     div[data-baseweb="button"] > button:hover,
     div[data-baseweb="button"] button:hover {{
-        background: {BTN_HOVER} !important;
-        transform: translateY(-1px) !important;
-    }}
-    div.stButton > button:active,
-    div.stDownloadButton > button:active,
-    button[kind="primary"]:active,
-    button[kind="secondary"]:active,
-    div[data-baseweb="button"] > button:active,
-    div[data-baseweb="button"] button:active {{
-        transform: translateY(0px) !important;
-        filter: brightness(0.98) !important;
+        background: {ACCENT} !important;
+        color: #000000 !important;
     }}
     div.stButton > button:focus-visible,
-    div.stDownloadButton > button:focus-visible,
-    button[kind="primary"]:focus-visible,
-    button[kind="secondary"]:focus-visible,
-    div[data-baseweb="button"] > button:focus-visible,
-    div[data-baseweb="button"] button:focus-visible {{
+    div.stDownloadButton > button:focus-visible {{
         outline: none !important;
-        box-shadow: 0 0 0 3px rgba(173, 214, 255, 0.22) !important;
-        border-color: rgba(173, 214, 255, 0.55) !important;
+        box-shadow: 0 0 0 2px {ACCENT} !important;
     }}
 
-    /* Uploader: в разных версиях кнопка живёт в dropzone/section */
     [data-testid="stFileUploader"] button,
     [data-testid="stFileUploaderDropzone"] button {{
         background: {BTN_BG} !important;
         color: {BTN_TEXT} !important;
         border: 1px solid {BTN_BORDER} !important;
-        border-radius: 12px !important;
+        border-radius: 0 !important;
         font-weight: 700 !important;
+        letter-spacing: 1px !important;
+        text-transform: uppercase !important;
     }}
     [data-testid="stFileUploader"] button:hover,
     [data-testid="stFileUploaderDropzone"] button:hover {{
-        background: {BTN_HOVER} !important;
+        background: {ACCENT} !important;
+        color: #000 !important;
     }}
 
     [data-testid="stFileUploaderDeleteBtn"] button {{
-        background: rgba(255,255,255,0.06) !important;
-        color: {TEXT} !important;
-        border: 1px solid {BTN_BORDER} !important;
+        background: {CARD} !important;
+        color: {MUTED} !important;
+        border: 1px solid {BORDER} !important;
+        border-radius: 0 !important;
     }}
     [data-testid="stFileUploaderDeleteBtn"] svg {{
-        fill: {TEXT} !important;
-        color: {TEXT} !important;
+        fill: {MUTED} !important;
+        color: {MUTED} !important;
     }}
 
     input, textarea, [data-baseweb="input"] input {{
         background: {CARD} !important;
         color: {TEXT} !important;
-        border-color: rgba(255,255,255,0.12) !important;
-        border-radius: 12px !important;
+        border-color: {BORDER} !important;
+        border-radius: 0 !important;
     }}
     input::placeholder, textarea::placeholder {{
         color: {MUTED} !important;
     }}
     input:focus, textarea:focus, [data-baseweb="input"] input:focus {{
         outline: none !important;
-        box-shadow: 0 0 0 3px rgba(173, 214, 255, 0.24) !important;
-        border-color: rgba(173, 214, 255, 0.55) !important;
+        box-shadow: 0 0 0 2px {ACCENT} !important;
+        border-color: {ACCENT} !important;
     }}
 
-    /* Ширина для основных action-кнопок */
     div.stButton > button, div.stDownloadButton > button {{
         width: 100%;
-        font-size: 16px !important;
+        font-size: 13px !important;
     }}
 
-    .stMarkdown, .stMarkdown p, .stCaption, label {{
+    .stMarkdown, .stMarkdown p, label {{
         color: {TEXT} !important;
     }}
-    .stCaption {{
+    .stCaption, [data-testid="stCaptionContainer"] p {{
         color: {MUTED} !important;
+        font-size: 11px !important;
     }}
 
-    /* Чекбоксы/радио */
     [data-testid="stCheckbox"] * {{
         color: {TEXT} !important;
     }}
@@ -4331,11 +4320,26 @@ st.markdown(
         accent-color: {ACCENT} !important;
     }}
 
+    /* Горизонтальная линия — тонкая оранжевая */
+    hr {{
+        border: none !important;
+        border-top: 1px solid {ACCENT} !important;
+        margin: 0.6rem 0 !important;
+        opacity: 0.4 !important;
+    }}
+
     /* Алерты */
     [data-testid="stAlert"] {{
-        border-radius: 14px !important;
-        border: 1px solid rgba(255,255,255,0.10) !important;
+        border-radius: 0 !important;
+        border: 1px solid {BORDER} !important;
+        border-left: 3px solid {ACCENT} !important;
         box-shadow: none !important;
+        background: {CARD} !important;
+    }}
+
+    /* Spinner */
+    [data-testid="stSpinner"] * {{
+        color: {ACCENT} !important;
     }}
     </style>
     """,
