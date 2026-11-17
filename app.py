@@ -249,38 +249,79 @@ def _egov_classify(name: str) -> Tuple[str, str]:
     return ('kz_ul', core)
 
 def _egov_confidence(query: str, result_name: str) -> bool:
-    """True если ВСЕ ключевые слова запроса присутствуют в результате."""
-    skip = {'товарищество','ограниченной','ответственностью','дополнительной',
-            'акционерное','общество','некоммерческое',
-            'государственное','республиканское','коммунальное','муниципальное',
-            'предприятие','учреждение','производственный','кооператив',
-            'сельскохозяйственный','крестьянское','фермерское','хозяйство',
-            'накопительный','пенсионный','микрокредитная','микрофинансовая','организация',
-            'компания','группа','объединение','холдинг','корпорация','фонд'}
-    # Для слов с одновременно кириллическими и латинскими буквами
-    # заменяем визуально схожие кирилл. символы на латинские (например «С»→C, «о»→o).
-    # Применяем ТОЛЬКО к смешанным словам, иначе "товарищество"→"tobapищество"
-    # и оно не попадёт в skip-список.
-    _homoglyph_tbl = str.maketrans('СсАаЕеОоРрХхКкТтМмВв', 'CcAaEeOoPpXxKkTtMmBb')
+    """True если ключевые слова запроса достаточно совпадают с результатом."""
+    skip = set([
+        "товарищество","ограниченной","ответственностью","дополнительной",
+        "акционерное","общество","некоммерческое",
+        "государственное","республиканское","коммунальное","муниципальное",
+        "предприятие","учреждение","производственный","кооператив",
+        "сельскохозяйственный","крестьянское","фермерское","хозяйство",
+        "накопительный","пенсионный","микрокредитная","микрофинансовая","организация",
+        "компания","группа","объединение","холдинг","корпорация","фонд",
+        "тоо","жск","гкп","рсо","мкк","мфо",
+        "company","limited","liability","incorporated","corporation",
+        "enterprise","holding","group","fund",
+        "anonim","sirketi",
+    ])
+    _quote_re = re.compile(chr(91) + str().join(chr(c) for c in [171,187,8220,8221,8222,8216,8217,8218,8219]) + chr(93))
+    _homoglyph_tbl = str.maketrans("СсАаЕеОоРрХхКкТтМмВв", "CcAaEeOoPpXxKkTtMmBb")
     def _norm_word(w: str) -> str:
-        has_cyr = any('Ѐ' <= c <= 'ӿ' for c in w)
-        has_lat = any('A' <= c <= 'Z' or 'a' <= c <= 'z' for c in w)
+        has_cyr = any(chr(1024) <= c <= chr(1279) for c in w)
+        has_lat = any(chr(65) <= c <= chr(90) or chr(97) <= c <= chr(122) for c in w)
         return w.translate(_homoglyph_tbl) if (has_cyr and has_lat) else w
-    # [^\W\d_] — любая Unicode-буква (не цифра, не _), покрывает казахские Ø/ø, Ħ/ħ и др.
-    _kw_re = re.compile(r'[^\W\d_]{3,}', re.UNICODE)
+    _kw_re = re.compile("[^\\W\\d_]{3,}", re.UNICODE)
     def keywords(s: str) -> set:
+        s = _quote_re.sub(chr(32), s)
         return {_norm_word(w).lower() for w in _kw_re.findall(s)
                 if _norm_word(w).lower() not in skip}
     q_kw = keywords(query)
     r_kw = keywords(result_name)
     if not q_kw:
-        return True
-    # Если запрос на латинице, а результат на кириллице (транслитерация) — доверяем ES
+        return not bool(r_kw)
     def _is_latin(w): return all(ord(c) < 0x400 for c in w)
     def _is_cyr(w):   return all(0x400 <= ord(c) <= 0x4FF for c in w)
-    if q_kw and r_kw and all(_is_latin(w) for w in q_kw) and all(_is_cyr(w) for w in r_kw):
+    # Запрос чисто Latin, результат чисто Cyrillic — транслитерация, доверяем ES
+    if all(_is_latin(w) for w in q_kw) and all(_is_cyr(w) for w in r_kw):
         return True
-    return q_kw <= r_kw
+    # Смешанный скрипт в запросе (напр. "KLV INSAAT (КЛВ ИНШААТ)"):
+    # проверяем только кириллическую часть запроса против результата
+    # или только латинскую часть — одно из должно быть подмножеством
+    q_kw_cyr = {w for w in q_kw if _is_cyr(w)}
+    q_kw_lat = {w for w in q_kw if _is_latin(w)}
+    if q_kw_cyr and q_kw_lat:
+        # оба скрипта в запросе → пробуем каждый независимо
+        if q_kw_cyr and q_kw_cyr <= r_kw:
+            return True
+        if q_kw_lat and q_kw_lat <= r_kw:
+            return True
+        return False
+    # Обычная проверка: все слова запроса есть в результате
+    if not (q_kw <= r_kw):
+        return False
+    extra = len(r_kw - q_kw)
+    if extra == 0:
+        return True
+    # Лишние слова в результате: разрешаем не более 1, но только если слова запроса
+    # стоят в результате в ТОМ ЖЕ порядке (неполное название конторы в wt).
+    # Если порядок перевёрнут — скорее всего другая компания с теми же словами.
+    if extra > 1:
+        return False
+    _kw_re2 = re.compile("[^\\W\\d_]{3,}", re.UNICODE)
+    def _ordered_kw(s):
+        return [_norm_word(w).lower() for w in _kw_re2.findall(s)
+                if _norm_word(w).lower() in q_kw]
+    q_ord = _ordered_kw(query)
+    r_ord = _ordered_kw(result_name)
+    if len(q_ord) < 2 or len(r_ord) < 2:
+        return True
+    # Проверяем порядок: позиции слов запроса в результате должны быть монотонно возрастающими
+    positions = []
+    for w in q_ord:
+        try:
+            positions.append(r_ord.index(w))
+        except ValueError:
+            return True
+    return positions == sorted(positions)
 
 def _egov_company_summary(name: str) -> dict:
     if name in _egov_cache:
@@ -306,16 +347,18 @@ def _egov_company_summary(name: str) -> dict:
                 "size": 5,
             })
             if rows:
-                c = rows[0]
-                confident = _egov_confidence(query, c.get("nameru", ""))
-                bin_val = c.get("bin", "")
+                best, confident = rows[0], False
+                for candidate in rows:
+                    if _egov_confidence(query, candidate.get("nameru", "")):
+                        best, confident = candidate, True
+                        break
                 result = {
-                    "found":   confident,
-                    "nameru":  c.get("nameru", ""),
-                    "bin":     bin_val,
-                    "regdate": c.get("regdate", ""),
-                    "director": c.get("director", ""),
-                    "note":    "" if confident else "Иностранная организация (БИН не подтверждён)",
+                    "found":    confident,
+                    "nameru":   best.get("nameru", ""),
+                    "bin":      best.get("bin", ""),
+                    "regdate":  best.get("regdate", ""),
+                    "director": best.get("director", ""),
+                    "note":     "" if confident else "Иностранная организация (БИН не подтверждён)",
                 }
             else:
                 result = {"found": False, "note": "Иностранная организация"}
@@ -335,19 +378,45 @@ def _egov_company_summary(name: str) -> dict:
             if not rows:
                 result = {"found": False, "note": "Не найдено в ГБД ЮЛ"}
             else:
-                c = rows[0]
-                confident = _egov_confidence(query, c.get("nameru", ""))
-                bin_val = c.get("bin", "")
+                # Берём первый из 5 результатов, прошедший confidence
+                best, confident = rows[0], False
+                for candidate in rows:
+                    if _egov_confidence(query, candidate.get("nameru", "")):
+                        best, confident = candidate, True
+                        break
+                # Дефис-ретрай: если 2 значимых слова и уверенного совпадения нет →
+                # пробуем соединить дефисом: "Ерболь ЭЛЬ" → "Ерболь-ЭЛЬ"
+                if not confident:
+                    _org_stop = {
+                        'товарищество','ограниченной','ответственностью','дополнительной',
+                        'акционерное','общество','некоммерческое','государственное',
+                        'республиканское','коммунальное','предприятие','учреждение',
+                        'производственный','кооператив','сельскохозяйственный',
+                        'крестьянское','фермерское','хозяйство','фонд','корпорация',
+                        'тоо','жск','гкп','рсо','мкк','мфо','ип','чп',
+                        'с','в','и','на','для',
+                    }
+                    _meaningful = [w for w in query.split()
+                                   if w.lower() not in _org_stop and len(w) >= 2]
+                    if len(_meaningful) == 2:
+                        hyphen_q = '-'.join(_meaningful)
+                        rows2 = _egov_v4("gbd_ul", {
+                            "query": {"query_string": {
+                                "query": hyphen_q, "fields": ["nameru"]}},
+                            "size": 5,
+                        })
+                        for candidate in (rows2 or []):
+                            if _egov_confidence(hyphen_q, candidate.get("nameru", "")):
+                                best, confident = candidate, True
+                                break
                 result = {
-                    "found":   confident,
-                    "nameru":  c.get("nameru", ""),
-                    "bin":     bin_val,
-                    "director": c.get("director", ""),
-                    "datereg":  c.get("datereg", ""),
+                    "found":    confident,
+                    "nameru":   best.get("nameru", ""),
+                    "bin":      best.get("bin", ""),
+                    "director": best.get("director", ""),
+                    "datereg":  best.get("datereg", ""),
                     "note":     "" if confident else "Возможно неверное совпадение",
                 }
-                if not confident:
-                    result["found"] = False
 
     _egov_cache[name] = result
     return result
@@ -2061,7 +2130,12 @@ def run_code_1(file_bytes: bytes) -> bytes:
             )
 
             if which == "cust":
-                rule_1210 = _rule_by_last_pay(3, 6, "сомнительный")
+                # "ОК" only when BOTH recent payment AND non-zero turnover in last 3 months
+                rule_1210 = (
+                    f"IF(({last_pos})=0,\"списание\","
+                    f"IF(AND(({months_since_last_pay})<=3,({sum_perf_0_3})<>0),\"ОК\","
+                    f"IF(({months_since_last_pay})<=6,\"сомнительный\",\"списание\")))"
+                )
                 return f"=IF($B{r}=\"\",\"\",IF($J{r}>0,{rule_1210},{rule_3510}))"
             # поставщики
             rule_1710 = _rule_by_last_pay(3, 6, "сомнительный")
@@ -2156,7 +2230,7 @@ def run_code_1(file_bytes: bytes) -> bytes:
                     row=r,
                     column=ci,
                     value=(
-                        f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$Y:$Y,$A{r},{mr_ref}!$G:$G,"6010")*{coef})'
+                        f'=IF($B{r}="","",SUMIFS({mr_ref}!$H:$H,{mr_ref}!$P:$P,{col_letter}$2,{mr_ref}!$X:$X,$A{r},{mr_ref}!$G:$G,"6010")*{coef})'
                     ),
                 ).number_format = num_fmt
                 ws2.cell(row=r, column=ci).alignment = align_c
@@ -3873,7 +3947,7 @@ def _gsc_parse_osv_data_cols(ws) -> Dict[str, int]:
 
     for row_cells in ws.iter_rows(min_row=1, max_row=20):
         for cell in row_cells:
-            if isinstance(cell, MergedCell):
+            if isinstance(cell , MergedCell):
                 continue
             v = str(cell.value or "").strip().lower()
             if "сальдо на начало" in v and saldo_nach_col is None:
@@ -4514,6 +4588,746 @@ def find_wt_sheets(file_bytes: bytes) -> List[str]:
         return []
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ADATA — синхронный клиент (токен → поллинг)
+# ─────────────────────────────────────────────────────────────────────────────
+import time as _time_lib
+
+_ADATA_KEY   = "vBpEhjCB7WmjKoAA5LfbIfM20ZnLYq1"
+_ADATA_BASE  = "https://api.adata.kz/api/company"
+_ADATA_ROOT  = "https://api.adata.kz/api"
+_ADATA_RATE  = 1.0 / 1.5          # мин. интервал между новыми токенами (1.5 req/s)
+_adata_session   = _requests_lib.Session()
+_adata_cache: Dict[str, dict] = {}
+_adata_last_req  = 0.0
+
+
+def _adata_get_token(module: str, bin_: str, root: bool = False) -> Tuple[Optional[str], Optional[str]]:
+    global _adata_last_req
+    base = _ADATA_ROOT if root else _ADATA_BASE
+    url  = f"{base}/{module}/{_ADATA_KEY}?iinBin={bin_}"
+    gap  = _adata_last_req + _ADATA_RATE - _time_lib.monotonic()
+    if gap > 0:
+        _time_lib.sleep(gap)
+    _adata_last_req = _time_lib.monotonic()
+    try:
+        data = _adata_session.get(url, timeout=30,
+                                  headers={"Accept": "application/json"}).json()
+    except Exception as e:
+        return None, f"error:{e}"
+    msg = str(data.get("message") or "")
+    if "not found" in msg.lower():
+        return None, "not_found"
+    token = data.get("token")
+    if not token:
+        return None, "no_token"
+    return token, None
+
+
+def _adata_poll(token: str, check_url: str = "") -> Tuple[str, Optional[dict]]:
+    url = f"{check_url or (_ADATA_BASE + '/info/check')}/{_ADATA_KEY}?token={token}"
+    for i in range(20):
+        if i:
+            _time_lib.sleep(min(i, 6))
+        try:
+            data = _adata_session.get(url, timeout=30,
+                                      headers={"Accept": "application/json"}).json()
+        except Exception:
+            continue
+        msg = str(data.get("message") or "")
+        if msg == "ready" and data.get("data") is not None:
+            return "ready", data["data"]
+        if "not found" in msg.lower():
+            return "not_found", None
+    return "wait", None
+
+
+def _adata_fetch(module: str, bin_: str, root: bool = False,
+                 check_url: str = "") -> Tuple[str, Optional[dict]]:
+    token, err = _adata_get_token(module, bin_, root=root)
+    if err:
+        return err, None
+    return _adata_poll(token, check_url=check_url)
+
+
+def _adata_fetch_taxes(bin_: str) -> Tuple[str, list]:
+    """Помесячные налоги за текущий и прошлый год."""
+    from datetime import date as _date
+    token, err = _adata_get_token("tax-deduction/extended", bin_)
+    if err:
+        return err, []
+    today  = _date.today()
+    years  = [today.year - 1, today.year]
+    rows   = []
+    for year in years:
+        page, last_page = 1, 1
+        while page <= last_page:
+            url = f"{_ADATA_BASE}/info/check/{_ADATA_KEY}?token={token}&page={page}&year={year}"
+            got = False
+            for i in range(20):
+                if i:
+                    _time_lib.sleep(min(i, 6))
+                try:
+                    data = _adata_session.get(url, timeout=30,
+                                              headers={"Accept": "application/json"}).json()
+                except Exception:
+                    continue
+                msg = str(data.get("message") or "")
+                if msg == "ready" and data.get("data") is not None:
+                    d = data["data"]
+                    rows.extend(d.get("details") or [])
+                    last_page = d.get("last_page", last_page)
+                    got = True
+                    break
+                if "not found" in msg.lower():
+                    return "not_found", []
+            if not got:
+                return "wait", rows
+            page += 1
+    return "ready", rows
+
+
+def _adata_tax_windows(rows: list) -> Tuple[float, float, float]:
+    """Считает L12M / L6M / L3M из помесячных налоговых платежей."""
+    from datetime import date as _date
+    today  = _date.today()
+    monthly: Dict[Tuple[int,int], float] = {}
+    for it in rows:
+        if it.get("pay_code") != "tax" or it.get("entry_code") != "payment":
+            continue
+        rd  = it.get("receipt_date")
+        amt = it.get("amount")
+        if not rd or amt in (None, ""):
+            continue
+        parts = str(rd).split("-")
+        if len(parts) < 2:
+            continue
+        try:
+            y, m = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        monthly[(y, m)] = monthly.get((y, m), 0.0) + float(amt)
+
+    end_y, end_m = today.year, today.month - 1
+    if end_m == 0:
+        end_m, end_y = 12, today.year - 1
+
+    def _win(months: int) -> float:
+        sm, sy = end_m - months + 1, end_y
+        while sm <= 0:
+            sm += 12; sy -= 1
+        total = 0.0
+        y, m = sy, sm
+        while (y, m) <= (end_y, end_m):
+            total += monthly.get((y, m), 0.0)
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+        return total
+
+    return _win(12), _win(6), _win(3)
+
+
+def _adata_risk_flags(info: dict, tax_rows: list) -> dict:
+    """Извлекает флаги риска и вердикт из данных ADATA."""
+    from datetime import date as _date
+
+    def gp(path: str):
+        cur = info
+        for k in path.split("."):
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                return None
+        return cur
+
+    def num(v) -> float:
+        try: return float(v or 0)
+        except: return 0.0
+
+    def b(v) -> bool:
+        if isinstance(v, bool): return v
+        if isinstance(v, (int, float)): return bool(v)
+        if isinstance(v, str): return v.strip().lower() == "true"
+        return False
+
+    today = _date.today()
+    flags = []   # (цвет, текст)
+
+    # ── Критичные (красные) ──────────────────────────────────────────────────
+    if b(gp("riskFactor.company.bankrupt")):
+        flags.append(("R", "Банкрот"))
+    if b(gp("riskFactor.company.liquidating_taxpayer")):
+        flags.append(("R", "В ликвидации"))
+    if b(gp("trustworthyExtended.finished")):
+        flags.append(("R", "Банкротство завершено"))
+    if not b(gp("status.company_status")):
+        flags.append(("R", "Недействующее"))
+
+    tax_debt = num(gp("status.tax_debt"))
+    if tax_debt > 50_000_000:
+        flags.append(("R", f"Налог.долг {tax_debt/1e6:.1f} млн"))
+    elif tax_debt > 500_000:
+        flags.append(("Y", f"Налог.долг {tax_debt/1e6:.1f} млн"))
+
+    enf = num(gp("riskFactor.company.enforcement_debt_sum"))
+    if enf > 25_000_000:
+        flags.append(("R", f"Исполы {enf/1e6:.1f} млн"))
+    elif enf > 250_000:
+        flags.append(("Y", f"Исполы {enf/1e6:.1f} млн"))
+    elif b(gp("riskFactor.company.enforcement_debt")):
+        flags.append(("Y", "Есть исполы"))
+
+    # ── Мягкие (жёлтые) ─────────────────────────────────────────────────────
+    if b(gp("riskFactor.company.seized_bank_account")):
+        flags.append(("Y", "Арест счетов"))
+    if b(gp("riskFactor.company.seized_property")):
+        flags.append(("Y", "Арест имущества"))
+
+    dir_enf = num(gp("riskFactor.head.enforcement_debt_sum"))
+    if dir_enf > 25_000_000:
+        flags.append(("R", f"Долг директора {dir_enf/1e6:.1f} млн"))
+    elif dir_enf > 250_000:
+        flags.append(("Y", f"Долг директора {dir_enf/1e6:.1f} млн"))
+
+    reg_str = gp("basic.date_registration")
+    if reg_str:
+        try:
+            p = str(reg_str).split("-")
+            reg = _date(int(p[0]), int(p[1]), int(p[2]))
+            yr_ago = today.replace(year=today.year - 1) if today.month > 2 else \
+                     today.replace(year=today.year - 1, day=28)
+            if reg > yr_ago:
+                flags.append(("Y", "Моложе года"))
+        except Exception:
+            pass
+
+    l12, l6, l3 = _adata_tax_windows(tax_rows)
+    if 0 < l12 < 10_000_000:
+        flags.append(("Y", f"LTM {l12/1e6:.1f} млн"))
+    if l12 > 0 and l6 < l12 * 0.10:
+        flags.append(("R", "LSM < 10% LTM"))
+    elif l12 > 0 and l6 < l12 * 0.25:
+        flags.append(("Y", "LSM < 25% LTM"))
+
+    rd = gp("riskFactor.company.tax_risk_degree") or ""
+    if rd and str(rd).lower() not in ("низкий", "low", ""):
+        flags.append(("Y", f"Налог.риск: {rd}"))
+
+    has_r = any(f[0] == "R" for f in flags)
+    has_y = any(f[0] == "Y" for f in flags)
+    verdict = "🔴 Критично" if has_r else ("🟡 Риски" if has_y else "🟢 Норма")
+    flag_str = "; ".join(("🔴 " if f[0]=="R" else "🟡 ") + f[1] for f in flags)
+
+    return {
+        "verdict":    verdict,
+        "flags":      flag_str,
+        "tax_l12m":   round(l12 / 1e6, 2),
+        "tax_l6m":    round(l6  / 1e6, 2),
+        "tax_l3m":    round(l3  / 1e6, 2),
+        "tax_debt":   tax_debt,
+        "enf_sum":    enf,
+        "name":       gp("basic.short_name") or gp("basic.name_ru") or "",
+        "director":   gp("basic.fullname_director") or "",
+        "employee_n": int(num(gp("basic.employee_count"))),
+        "oked":       gp("basic.oked") or "",
+        "active":     b(gp("status.company_status")),
+        "is_ip":      gp("basic.counterparty_type") in ("enterprise", "individual"),
+    }
+
+
+def _adata_company_summary(bin_: str) -> dict:
+    """Полная оценка компании через ADATA. Результат кэшируется на сессию."""
+    bin_ = str(bin_ or "").strip()
+    if len(bin_) < 10:
+        return {"error": "Нет БИН"}
+    if bin_ in _adata_cache:
+        return _adata_cache[bin_]
+
+    status, info = _adata_fetch("info", bin_)
+    if status != "ready" or not info:
+        result = {"error": f"ADATA: {status}"}
+        _adata_cache[bin_] = result
+        return result
+
+    is_ip = info.get("basic", {}).get("counterparty_type") in ("enterprise", "individual")
+    tax_rows: list = []
+    if not is_ip:
+        _, tax_rows = _adata_fetch_taxes(bin_)
+
+    risk = _adata_risk_flags(info, tax_rows)
+    result = {"found": True, "bin": bin_, **risk}
+    _adata_cache[bin_] = result
+    return result
+
+
+def _adata_affiliations_by_type(bin_: str) -> Tuple[str, Optional[dict]]:
+    """Аффилированные лица по типу (director/founder/old_director/old_founder/phone).
+
+    Эндпоинт: relation-scheme/affiliation-by-type
+    Check URL: relation-scheme/check  (свой, не общий info/check)
+    """
+    cache_key = f"affil_{bin_}"
+    if cache_key in _adata_cache:
+        return "ready", _adata_cache[cache_key]
+    check_url = f"{_ADATA_BASE}/relation-scheme/check"
+    status, data = _adata_fetch("relation-scheme/affiliation-by-type", bin_,
+                                check_url=check_url)
+    if status == "ready" and data:
+        _adata_cache[cache_key] = data
+    return status, data
+
+
+def _collect_affil_bins(data: dict) -> Dict[str, Tuple[str, str]]:
+    """Из ответа affiliation-by-type собирает {biin: (тип_связи, имя)}."""
+    TYPE_LABELS = {
+        "director":     "Директор",
+        "founder":      "Учредитель",
+        "old_director": "Бывший директор",
+        "old_founder":  "Бывший учредитель",
+        "phone":        "Общий телефон",
+    }
+    bins: Dict[str, Tuple[str, str]] = {}
+    for key, label in TYPE_LABELS.items():
+        for item in (data.get(key) or []):
+            biin = str(item.get("biin") or "").strip()
+            if not biin or len(biin) < 10:
+                continue
+            name = str(item.get("name") or "").strip()
+            if biin in bins:
+                prev_label = bins[biin][0]
+                if label not in prev_label:
+                    bins[biin] = (prev_label + " / " + label, name)
+            else:
+                bins[biin] = (label, name)
+    return bins
+
+
+def _adata_director_companies(iinbin: str) -> Tuple[str, List[dict]]:
+    """Компании, в которых iinbin является директором/учредителем.
+
+    Эндпоинт: company/director-in-companies   Check: info/check (стандартный).
+    Поддерживает пагинацию через ?page=N.
+    """
+    cache_key = f"dir_co_{iinbin}"
+    if cache_key in _adata_cache:
+        return "ready", _adata_cache[cache_key]
+    token, err = _adata_get_token("director-in-companies", iinbin)
+    if err:
+        return err, []
+    all_details: List[dict] = []
+    page = 1
+    last_page = 1
+    check_base = f"{_ADATA_BASE}/info/check/{_ADATA_KEY}"
+    while page <= last_page:
+        url = f"{check_base}?token={token}&page={page}"
+        got = False
+        for i in range(20):
+            if i:
+                _time_lib.sleep(min(i, 6))
+            try:
+                resp = _adata_session.get(url, timeout=30,
+                                          headers={"Accept": "application/json"}).json()
+            except Exception:
+                continue
+            msg = str(resp.get("message") or "")
+            if msg == "ready" and resp.get("data") is not None:
+                d = resp["data"]
+                all_details.extend(d.get("details") or [])
+                last_page = int(d.get("last_page") or last_page)
+                got = True
+                break
+            if "not found" in msg.lower():
+                return "not_found", []
+        if not got:
+            break
+        page += 1
+    if all_details:
+        _adata_cache[cache_key] = all_details
+    return "ready", all_details
+
+
+def _extract_client_bin(filename: str) -> Optional[str]:
+    """Извлекает 12-значный БИН из имени файла (_анализ_123456789012.xlsx)."""
+    m = re.search(r'\d{12}', filename or "")
+    return m.group(0) if m else None
+
+
+def read_wt_counterparties_with_amounts(
+        file_bytes: bytes, sheet_name: str) -> List[Tuple[str, str, float]]:
+    """Читает wt-лист: возвращает (таблица, контрагент, сумма_AP).
+
+    Колонка B — название контрагента.
+    Колонка AP (42) — оборот за весь период.
+    """
+    _SUMMARY  = {'топ', 'всего', 'доля'}
+    _SKIP_TBL = re.compile(r'inflow|outflow', re.IGNORECASE)
+    _SKIP_VAL = re.compile(
+        r'^[\s\-–—\.,:;/\\0-9]+$'
+        r'|^(?:н/?д|нет\s+данных?|не\s+определ|прочи[ех]?|разные?|итого)$',
+        re.IGNORECASE,
+    )
+    results: List[Tuple[str, str, float]] = []
+    try:
+        wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        ws = wb[sheet_name]
+        current_table: Optional[str] = None
+        in_table = False
+        for row in ws.iter_rows(min_col=2, max_col=42, values_only=True):
+            name_val = row[0]    # col B
+            ap_val   = row[40]   # col AP (offset 40 from col B)
+            if name_val is None:
+                continue
+            s = str(name_val).strip()
+            if not s:
+                continue
+            s_low = s.lower()
+            if s_low in _SUMMARY:
+                if s_low == 'топ':
+                    in_table = False
+                    current_table = None
+                continue
+            if not in_table:
+                current_table = s
+                in_table = True
+            else:
+                if current_table and _SKIP_TBL.search(current_table):
+                    continue
+                if _SKIP_VAL.match(s):
+                    continue
+                if current_table:
+                    try:
+                        amount = float(ap_val) if ap_val is not None else 0.0
+                    except (TypeError, ValueError):
+                        amount = 0.0
+                    results.append((current_table, s, amount))
+        wb.close()
+    except Exception:
+        pass
+    return results
+
+
+def run_related_companies_sheet(
+        file_bytes: bytes, wt_sheets: List[str], filename: str) -> Tuple[bytes, str]:
+    """Модуль "Связанные компании".
+
+    1. Извлекает БИН клиента из имени файла.
+    2. Параллельно: ищет БИНы контрагентов (ГБД ЮЛ) + запрашивает аффилированных (ADATA).
+    3. Создаёт лист "связанные" всегда — со всеми контрагентами и их статусом.
+    Возвращает (file_bytes, статус_сообщение).
+    """
+    import concurrent.futures
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    client_bin = _extract_client_bin(filename)
+
+    # Собираем контрагентов со всех wt-листов (поддержка нескольких wt с префиксами)
+    all_cps: List[Tuple[str, str, str, float]] = []  # (wt_sh, table, name, amount)
+    for wt_sh in wt_sheets:
+        for tbl, name, amt in read_wt_counterparties_with_amounts(file_bytes, wt_sh):
+            all_cps.append((wt_sh, tbl, name, amt))
+
+    # ── Параллельные задачи ──────────────────────────────────────────────────
+    def _lookup_bins() -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        seen: set = set()
+        for _, _, name, _ in all_cps:
+            if name in seen:
+                continue
+            seen.add(name)
+            eg = _egov_company_summary(name)
+            out[name] = eg
+        return out
+
+    def _lookup_affil() -> Tuple[Dict[str, Tuple[str, str]], Optional[dict]]:
+        if not client_bin:
+            return {}, None
+        status, data = _adata_affiliations_by_type(client_bin)
+        if status == "ready" and data:
+            return _collect_affil_bins(data), data
+        return {}, None
+
+    def _lookup_dir_cos() -> List[dict]:
+        if not client_bin:
+            return []
+        _, details = _adata_director_companies(client_bin)
+        return details or []
+
+    if all_cps and client_bin:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            f_bins    = ex.submit(_lookup_bins)
+            f_affil   = ex.submit(_lookup_affil)
+            f_dir_cos = ex.submit(_lookup_dir_cos)
+            name_to_eg            = f_bins.result()
+            affil_bins, affil_raw = f_affil.result()
+            dir_cos_raw: List[dict] = f_dir_cos.result()
+    elif all_cps:
+        name_to_eg = _lookup_bins()
+        affil_bins, affil_raw = {}, None
+        dir_cos_raw = []
+    else:
+        name_to_eg  = {}
+        affil_bins, affil_raw = {}, None
+        dir_cos_raw = []
+
+    # Мержим director-in-companies в affil_bins (дедупликация по BIN)
+    DIR_CO_LABEL = "Директор/учредитель в компании"
+    for item in dir_cos_raw:
+        b = str(item.get("bin") or "").strip()
+        if not b:
+            continue
+        n = str(item.get("short_name") or "").strip()
+        if b in affil_bins:
+            prev_lbl, prev_nm = affil_bins[b]
+            if DIR_CO_LABEL not in prev_lbl:
+                affil_bins[b] = (prev_lbl + " / " + DIR_CO_LABEL, prev_nm or n)
+        else:
+            affil_bins[b] = (DIR_CO_LABEL, n)
+
+    # ── Строим полную таблицу ────────────────────────────────────────────────
+    # дедупликация: один контрагент может встречаться в нескольких wt
+    rows_affiliated = []
+    rows_other      = []
+    seen_key: set   = set()
+
+    for wt_sh, tbl, name, amount in all_cps:
+        key = (wt_sh, tbl, name)
+        if key in seen_key:
+            continue
+        seen_key.add(key)
+
+        eg        = name_to_eg.get(name, {})
+        # БИН берём только при confirmed match (found=True), иначе ES мог вернуть ложный результат
+        cp_bin    = str(eg.get("bin", "") or "").strip() if eg.get("found") else ""
+        bin_found = bool(cp_bin)
+        is_affil  = bin_found and cp_bin in affil_bins
+        rel_type  = affil_bins[cp_bin][0] if is_affil else ""
+        affil_nm  = affil_bins[cp_bin][1] if is_affil else ""
+        egov_name = str(eg.get("nameru", "") or "").strip() if eg.get("found") else ""
+
+        rec = {
+            "Лист wt":         wt_sh,
+            "Таблица":         tbl,
+            "Контрагент (wt)": name,
+            "Оборот (AP)":     amount,
+            "БИН":             cp_bin,
+            "Найдено в ГБД":   egov_name,
+            "Связанный?":      "ДА" if is_affil else "",
+            "Тип связи":       rel_type,
+            "Имя в ADATA":     affil_nm,
+        }
+        if is_affil:
+            rows_affiliated.append(rec)
+        else:
+            rows_other.append(rec)
+
+    all_rows = rows_affiliated + rows_other
+    n_affil  = len(rows_affiliated)
+
+    # ── Создаём лист "связанные" ─────────────────────────────────────────────
+    wb = load_workbook(io.BytesIO(file_bytes))
+    if "связанные" in wb.sheetnames:
+        del wb["связанные"]
+    ws = wb.create_sheet("связанные")
+
+    # Стили
+    hdr_font   = Font(name="Calibri", size=10, bold=True, color="FFFFFFFF")
+    hdr_fill   = PatternFill(fill_type="solid", fgColor="FF0D0D0D")
+    body_font  = Font(name="Calibri", size=10)
+    bold_font  = Font(name="Calibri", size=10, bold=True)
+    acc_fill   = PatternFill(fill_type="solid", fgColor="FFFF6600")  # orange — связанный
+    dim_fill   = PatternFill(fill_type="solid", fgColor="FFF5F5F5")  # светлый — прочие
+    meta_font  = Font(name="Calibri", size=10, italic=True, color="FF666666")
+    ok_font    = Font(name="Calibri", size=10, bold=True, color="FF000000")
+    thin       = Side(style="thin", color="FFCCCCCC")
+    border     = Border(bottom=thin)
+    align_c    = Alignment(horizontal="center", vertical="center")
+    align_l    = Alignment(horizontal="left",   vertical="center")
+
+    # Строка 1: сводка
+    ws.merge_cells("A1:I1")
+    summary_parts = [f"БИН клиента: {client_bin or 'не определён'}"]
+    summary_parts.append(f"wt-листов: {len(wt_sheets)}")
+    summary_parts.append(f"контрагентов: {len(all_rows)}")
+    summary_parts.append(f"связанных: {n_affil}")
+    summary_parts.append(f"директор в компаниях: {len(dir_cos_raw)}")
+    if not client_bin:
+        summary_parts.append("⚠ БИН не найден в имени файла")
+    c = ws["A1"]
+    c.value = "   |   ".join(summary_parts)
+    c.font  = meta_font
+    c.alignment = align_l
+    ws.row_dimensions[1].height = 18
+
+    # Строка 2: заголовки
+    HEADERS = ["Лист wt", "Таблица", "Контрагент (wt)", "Оборот (AP)",
+               "БИН", "Найдено в ГБД", "Связанный?", "Тип связи", "Имя в ADATA"]
+    for ci, h in enumerate(HEADERS, 1):
+        c = ws.cell(row=2, column=ci, value=h)
+        c.font      = hdr_font
+        c.fill      = hdr_fill
+        c.alignment = align_c
+
+    # Данные начиная с row 3
+    for ri, rec in enumerate(all_rows, 3):
+        is_affil_row = bool(rec["Связанный?"])
+        row_fill = acc_fill if is_affil_row else dim_fill
+        for ci, h in enumerate(HEADERS, 1):
+            val = rec[h]
+            c   = ws.cell(row=ri, column=ci, value=val)
+            c.border = border
+            c.alignment = align_c if h in ("Лист wt", "Оборот (AP)", "БИН", "Связанный?", "Тип связи") else align_l
+            if is_affil_row:
+                c.fill = row_fill
+                c.font = ok_font
+            else:
+                c.font = body_font
+            if h == "Оборот (AP)" and isinstance(val, (int, float)):
+                c.number_format = "#,##0"
+        # Контрагент col всегда bold
+        ws.cell(row=ri, column=3).font = bold_font if not is_affil_row else ok_font
+
+    if not all_rows:
+        ws.cell(row=3, column=1, value="Контрагенты не найдены на wt-листах").font = meta_font
+
+    COL_WIDTHS = [14, 32, 46, 16, 16, 46, 14, 22, 46]
+    for ci, w in enumerate(COL_WIDTHS, 1):
+        ws.column_dimensions[ws.cell(row=2, column=ci).column_letter].width = w
+    ws.row_dimensions[2].height = 18
+    ws.freeze_panes = "A3"
+
+    # ── Вторая секция: все аффилированные из ADATA (raw JSON) ────────────────
+    TYPE_ORDER = [
+        ("director",     "Директор"),
+        ("founder",      "Учредитель"),
+        ("old_director", "Бывший директор"),
+        ("old_founder",  "Бывший учредитель"),
+        ("phone",        "Общий телефон"),
+    ]
+    sec2_start = len(all_rows) + 5  # через 2 пустые строки после основной таблицы
+
+    sec2_hdr_fill = PatternFill(fill_type="solid", fgColor="FF1A1A1A")
+    sec2_grp_fill = PatternFill(fill_type="solid", fgColor="FF2D2D2D")
+    sec2_grp_font = Font(name="Calibri", size=10, bold=True, color="FFFF6600")
+    sec2_body_font = Font(name="Calibri", size=10, color="FF111111")
+
+    # Заголовок секции
+    ws.merge_cells(f"A{sec2_start}:D{sec2_start}")
+    c = ws.cell(row=sec2_start, column=1,
+                value=f"Аффилированные лица клиента (ADATA) — БИН {client_bin or '?'}")
+    c.font      = Font(name="Calibri", size=10, bold=True, color="FFFFFFFF")
+    c.fill      = sec2_hdr_fill
+    c.alignment = align_l
+    ws.row_dimensions[sec2_start].height = 16
+
+    # Заголовки колонок
+    SEC2_HDRS = ["Тип связи", "БИН / ИИН", "Имя", "Доп. инфо"]
+    hdr_row = sec2_start + 1
+    for ci, h in enumerate(SEC2_HDRS, 1):
+        c = ws.cell(row=hdr_row, column=ci, value=h)
+        c.font      = hdr_font
+        c.fill      = hdr_fill
+        c.alignment = align_c
+    ws.row_dimensions[hdr_row].height = 16
+
+    cur_row = hdr_row + 1
+    if affil_raw:
+        for key, label in TYPE_ORDER:
+            items = affil_raw.get(key) or []
+            if not items:
+                continue
+            # Строка-группа с названием типа
+            ws.merge_cells(f"A{cur_row}:D{cur_row}")
+            gc = ws.cell(row=cur_row, column=1, value=f"▸  {label}  ({len(items)})")
+            gc.font      = sec2_grp_font
+            gc.fill      = sec2_grp_fill
+            gc.alignment = align_l
+            cur_row += 1
+            for item in items:
+                biin  = str(item.get("biin") or item.get("bin") or "").strip()
+                name  = str(item.get("name") or item.get("nameru") or "").strip()
+                # Собираем доп. поля (все кроме biin/bin/name/nameru)
+                extra_parts = []
+                for fk, fv in item.items():
+                    if fk.lower() in ("biin", "bin", "name", "nameru"):
+                        continue
+                    if fv not in (None, "", [], {}):
+                        extra_parts.append(f"{fk}: {fv}")
+                extra = "; ".join(extra_parts)
+
+                row_vals = [label, biin, name, extra]
+                for ci, val in enumerate(row_vals, 1):
+                    c = ws.cell(row=cur_row, column=ci, value=val)
+                    c.font      = sec2_body_font
+                    c.border    = border
+                    c.alignment = align_c if ci in (1, 2) else align_l
+                cur_row += 1
+    else:
+        ws.cell(row=cur_row, column=1,
+                value="Данные от ADATA не получены").font = meta_font
+
+    # Ширины колонок для секции 2 (A-D)
+    for ci, w in zip(range(1, 5), [22, 18, 50, 60]):
+        ws.column_dimensions[ws.cell(row=hdr_row, column=ci).column_letter].width = max(
+            ws.column_dimensions[ws.cell(row=hdr_row, column=ci).column_letter].width or 0, w)
+
+    # ── Секция 3: Компании, в которых клиент является директором/учредителем ─
+    sec3_start = cur_row + 2
+    ws.merge_cells(f"A{sec3_start}:E{sec3_start}")
+    c3h = ws.cell(row=sec3_start, column=1,
+                  value=f"Компании, где клиент — директор/учредитель (ADATA director-in-companies) — БИН {client_bin or '?'}")
+    c3h.font      = Font(name="Calibri", size=10, bold=True, color="FFFFFFFF")
+    c3h.fill      = PatternFill(fill_type="solid", fgColor="FF1A1A1A")
+    c3h.alignment = align_l
+    ws.row_dimensions[sec3_start].height = 16
+
+    SEC3_HDRS = ["БИН", "Название", "Активна?", "Надёжная?", "Дата окончания"]
+    s3_hdr_row = sec3_start + 1
+    for ci, h in enumerate(SEC3_HDRS, 1):
+        c = ws.cell(row=s3_hdr_row, column=ci, value=h)
+        c.font      = hdr_font
+        c.fill      = hdr_fill
+        c.alignment = align_c
+    ws.row_dimensions[s3_hdr_row].height = 16
+
+    s3_cur = s3_hdr_row + 1
+    if dir_cos_raw:
+        for item in dir_cos_raw:
+            b    = str(item.get("bin") or "").strip()
+            nm   = str(item.get("short_name") or "").strip()
+            inactive = item.get("is_inactive")
+            trust    = item.get("trustworthy")
+            end_dt   = str(item.get("end_date") or "").strip()
+            active_str = "нет" if inactive else "да"
+            trust_str  = "да" if trust else ("нет" if trust is False else "")
+            row_vals = [b, nm, active_str, trust_str, end_dt]
+            is_inactive_row = bool(inactive)
+            for ci, val in enumerate(row_vals, 1):
+                c = ws.cell(row=s3_cur, column=ci, value=val)
+                c.font      = Font(name="Calibri", size=10,
+                                   color="FF888888" if is_inactive_row else "FF111111")
+                c.border    = border
+                c.alignment = align_c if ci in (1, 3, 4, 5) else align_l
+            s3_cur += 1
+    else:
+        ws.cell(row=s3_cur, column=1,
+                value="Данные от ADATA не получены или клиент не зарегистрирован как директор").font = meta_font
+
+    for ci, w in zip(range(1, 6), [18, 52, 12, 14, 18]):
+        col_letter = ws.cell(row=s3_hdr_row, column=ci).column_letter
+        ws.column_dimensions[col_letter].width = max(
+            ws.column_dimensions[col_letter].width or 0, w)
+
+    out = io.BytesIO()
+    wb.save(out)
+    msg = (f"Связанные: {n_affil} из {len(all_rows)} контрагентов, "
+           f"директор в {len(dir_cos_raw)} компаниях "
+           f"(БИН клиента: {client_bin or 'не определён'})")
+    return out.getvalue(), msg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def read_wt_all_counterparties(file_bytes: bytes, sheet_name: str) -> List[Tuple[str, str]]:
     """
     Читает все таблицы с листа wt.
@@ -4699,7 +5513,7 @@ def run_egov_clients_sheet(file_bytes: bytes, wt_sheets: List[str]) -> bytes:
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="TERMINAL", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="CF app", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
 # Bloomberg Terminal theme
 BG     = "#000000"
@@ -4717,6 +5531,8 @@ BTN_HOVER  = "#2A2A2A"
 st.markdown(
     f"""
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&display=swap');
+
     #MainMenu {{visibility: hidden;}}
     footer {{visibility: hidden;}}
     header {{visibility: hidden;}}
@@ -4728,7 +5544,7 @@ st.markdown(
 
     html, body, [class*="css"], .stApp {{
         font-size: 13px !important;
-        font-family: "Consolas", "Courier New", monospace !important;
+        font-family: "IBM Plex Mono", "Consolas", monospace !important;
     }}
 
     button, input, textarea, select, option,
@@ -4736,13 +5552,18 @@ st.markdown(
     [data-baseweb],
     [data-baseweb] *,
     [data-testid] * {{
-        font-family: "Consolas", "Courier New", monospace !important;
+        font-family: "IBM Plex Mono", "Consolas", monospace !important;
     }}
 
     .block-container {{
-        max-width: 1100px;
+        max-width: 1160px;
         padding-top: 1rem;
         padding-bottom: 1rem;
+    }}
+
+    /* Убираем все скругления — Bloomberg всё квадратное */
+    *, *::before, *::after {{
+        border-radius: 0 !important;
     }}
 
     /* Заголовки секций — оранжевая левая полоса */
@@ -4752,7 +5573,7 @@ st.markdown(
         letter-spacing: 1.5px !important;
         text-transform: uppercase !important;
         color: {ACCENT} !important;
-        font-family: "Consolas", "Courier New", monospace !important;
+        font-family: "IBM Plex Mono", "Consolas", monospace !important;
         border-left: 3px solid {ACCENT};
         padding-left: 8px;
         margin: 0.8rem 0 0.5rem 0 !important;
@@ -4894,10 +5715,186 @@ st.markdown(
     [data-testid="stSpinner"] * {{
         color: {ACCENT} !important;
     }}
+
+    /* Progress bar */
+    [data-testid="stProgressBar"] > div > div {{
+        background: {ACCENT} !important;
+    }}
+    [data-testid="stProgressBar"] > div {{
+        background: #1A1A1A !important;
+        border-radius: 0 !important;
+        height: 6px !important;
+    }}
+
+    /* Select / Multiselect */
+    [data-baseweb="select"] > div,
+    [data-baseweb="select"] div[class*="ValueContainer"],
+    [data-baseweb="popover"] ul,
+    [data-baseweb="menu"] {{
+        background: {CARD} !important;
+        border-color: {BORDER} !important;
+        border-radius: 0 !important;
+        color: {TEXT} !important;
+    }}
+    [data-baseweb="select"] span,
+    [data-baseweb="select"] div {{
+        color: {TEXT} !important;
+    }}
+    [data-baseweb="option"]:hover,
+    [data-baseweb="option"][aria-selected="true"] {{
+        background: #1A0800 !important;
+        color: {ACCENT} !important;
+    }}
+    [data-baseweb="tag"] {{
+        background: #1A0800 !important;
+        border: 1px solid {ACCENT} !important;
+        border-radius: 0 !important;
+    }}
+    [data-baseweb="tag"] span {{
+        color: {ACCENT} !important;
+    }}
+
+    /* Expander */
+    .stExpander > details {{
+        background: {CARD} !important;
+        border: 1px solid {BORDER} !important;
+    }}
+    .stExpander > details > summary {{
+        background: #0F0F0F !important;
+        color: {ACCENT} !important;
+        font-size: 11px !important;
+        font-weight: 700 !important;
+        letter-spacing: 1px !important;
+        text-transform: uppercase !important;
+        border-bottom: 1px solid {BORDER} !important;
+        padding: 8px 12px !important;
+    }}
+    .stExpander > details > summary:hover {{
+        background: #1A0800 !important;
+    }}
+    .stExpander > details[open] > summary {{
+        border-left: 3px solid {ACCENT} !important;
+    }}
+
+    /* Info / success / warning / error */
+    [data-testid="stAlert"][data-baseweb="notification"] {{
+        border-left: 3px solid {ACCENT} !important;
+        background: {CARD} !important;
+        color: {TEXT} !important;
+    }}
+    div[class*="stInfo"] {{ border-left-color: #4488FF !important; }}
+    div[class*="stSuccess"] {{ border-left-color: #00CC44 !important; }}
+    div[class*="stWarning"] {{ border-left-color: #FFCC00 !important; }}
+    div[class*="stError"] {{ border-left-color: #FF2222 !important; }}
+
+    /* Metric виджеты */
+    [data-testid="stMetric"] {{
+        background: {CARD} !important;
+        border: 1px solid {BORDER} !important;
+        padding: 8px 12px !important;
+    }}
+    [data-testid="stMetricValue"] {{
+        color: {ACCENT} !important;
+        font-size: 20px !important;
+        font-weight: 700 !important;
+    }}
+    [data-testid="stMetricLabel"] {{
+        color: {MUTED} !important;
+        font-size: 10px !important;
+        letter-spacing: 1px !important;
+        text-transform: uppercase !important;
+    }}
+
+    /* Columns separator */
+    [data-testid="column"] {{
+        padding: 0 6px !important;
+    }}
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {{ width: 5px; height: 5px; }}
+    ::-webkit-scrollbar-track {{ background: {BG}; }}
+    ::-webkit-scrollbar-thumb {{ background: #333; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: {ACCENT}; }}
+
+    /* Topbar */
+    .bb-topbar {{
+        position: fixed;
+        top: 0; left: 0; right: 0;
+        height: 26px;
+        background: {ACCENT};
+        color: #000;
+        display: flex;
+        align-items: center;
+        padding: 0 16px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: .1em;
+        z-index: 9999;
+        font-family: "IBM Plex Mono", monospace;
+        gap: 0;
+        overflow: hidden;
+        white-space: nowrap;
+    }}
+    .bb-topbar-sep {{
+        width: 1px; height: 100%;
+        background: rgba(0,0,0,.30);
+        margin: 0 10px; flex-shrink: 0;
+    }}
+    .bb-topbar-right {{
+        margin-left: auto;
+        opacity: .55;
+        font-weight: 400;
+        flex-shrink: 0;
+        padding-left: 10px;
+    }}
+    .bb-topbar-dim {{
+        opacity: .70;
+        font-weight: 500;
+    }}
+    .bb-topbar-mods {{
+        opacity: .80;
+        font-weight: 400;
+        letter-spacing: .06em;
+    }}
+    /* сдвигаем контент под топбар */
+    .appview-container .main .block-container {{
+        padding-top: 2.2rem !important;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+topbar_ph = st.empty()
+
+
+def _render_topbar(company: str = "", bin_: str = "", modules: list = None) -> str:
+    co  = company.upper()[:35] if company else ""
+    bn  = bin_ or ""
+    co_part = (
+        f'<span class="bb-topbar-sep"></span>'
+        f'<span class="bb-topbar-dim">{co}</span>'
+    ) if co else ""
+    bn_part = (
+        f'<span class="bb-topbar-sep"></span>'
+        f'<span class="bb-topbar-dim">БИН&nbsp;{bn}</span>'
+    ) if bn else ""
+    mods = modules or []
+    mods_part = (
+        f'<span class="bb-topbar-sep"></span>'
+        f'<span class="bb-topbar-mods">{" · ".join(mods)}</span>'
+    ) if mods else ""
+    return (
+        f'<div class="bb-topbar">'
+        f'<span>CREDITFLOW</span>'
+        f'{co_part}{bn_part}{mods_part}'
+        f'<div class="bb-topbar-right">КЗ</div>'
+        f'</div>'
+    )
+
+
+topbar_ph.markdown(_render_topbar(), unsafe_allow_html=True)
+
 
 def classify_uploads(uploads) -> Dict[str, object]:
     analysis = []
@@ -5230,11 +6227,45 @@ if "prepared_bytes" in st.session_state:
     if not saldo_ok:
         st.caption("Сальдо недоступно: не найдены листы, заканчивающиеся на 1210/1710/3310/3510.")
 
+    inv_available_any = bool(inv_accounts_found)
+    opt_inventory = st.checkbox("Запасы", value=False, disabled=(not inv_available_any))
+    if not inv_available_any:
+        st.caption("Запасы недоступны: не найдены ОСВ-листы по счетам 13**.")
+
+    inventory_accounts: List[str] = inv_accounts_found if opt_inventory else []
+
+    opt_gos = st.checkbox("Госы", value=False, disabled=(not gos_ok))
+    if not gos_ok:
+        st.caption("Госы недоступны: не найдены листы, содержащие «гос» в названии.")
+
+    selected_gos_sheets: List[str] = []
+    gos_token = "711d774c72600d3a14b6df6ec7642533"
+    if opt_gos and gos_sheets:
+        st.caption("Выбери листы «гос*» для обработки:")
+        for sh in gos_sheets:
+            pad, col1 = st.columns([1, 6])
+            with pad:
+                st.write("")
+            with col1:
+                on = st.checkbox(sh, value=False, key=f"gos_pick::{sh}")
+            if on:
+                selected_gos_sheets.append(sh)
+
     opt_clients = st.checkbox("Контрагенты", value=False, disabled=(not clients_ok))
     if not clients_ok:
         st.caption("Контрагенты недоступны: не найден лист wt.")
+
+    # Связанные компании: нужен wt-лист + БИН в имени файла
+    _has_client_bin = any(_extract_client_bin(u.name or "") for u in uploads if hasattr(u, "name"))
+    related_ok = clients_ok and _has_client_bin
+    opt_related = st.checkbox("Связанные компании (ADATA)", value=False, disabled=(not related_ok))
+    if not related_ok:
+        if not clients_ok:
+            st.caption("Связанные: не найден лист wt.")
+        else:
+            st.caption("Связанные: БИН клиента не найден в имени файла (_анализ_БИНКЛИЕНТА.xlsx).")
     selected_wt_sheets: List[str] = []
-    if opt_clients and wt_sheets_avail:
+    if (opt_clients or opt_related) and wt_sheets_avail:
         if len(wt_sheets_avail) == 1:
             selected_wt_sheets = wt_sheets_avail[:]
             st.caption(f"Источник: лист **{wt_sheets_avail[0]}**")
@@ -5247,50 +6278,6 @@ if "prepared_bytes" in st.session_state:
                 with _col1:
                     if st.checkbox(_wsh, value=False, key=f"wt_pick::{_wsh}"):
                         selected_wt_sheets.append(_wsh)
-
-    inv_available_any = bool(inv_accounts_found)
-    opt_inventory = st.checkbox("Запасы", value=False, disabled=(not inv_available_any))
-    if not inv_available_any:
-        st.caption("Запасы недоступны: не найдены ОСВ-листы по счетам 13**.")
-
-    inventory_accounts: List[str] = inv_accounts_found if opt_inventory else []
-
-    opt_insights = st.checkbox("Инсайты", value=False, disabled=(not insights_ok))
-    if insights_existing:
-        st.warning("Инс уже есть в файле: " + ", ".join(insights_existing) + ". Повторно не генерирую.")
-    if insights_legacy:
-        st.caption("Найдены старые листы «инсайты» — при запуске будут переименованы в «инс» и перенесены в конец файла.")
-    if not insights_ok:
-        if insights_existing:
-            st.caption("Инс недоступен: для всех найденных префиксов лист «инс» уже существует.")
-        else:
-            st.caption("Инсайты недоступны: нужны листы W, M, Mt, Wt (лист «общ» — только для блока 6).")
-    elif insights_missing and insights_existing:
-        st.caption("Будут добавлены только отсутствующие: " + ", ".join(insights_missing) + ".")
-
-    opt_gos = st.checkbox("Госы", value=False, disabled=(not gos_ok))
-    if not gos_ok:
-        st.caption("Госы недоступны: не найдены листы, содержащие «гос» в названии.")
-
-    selected_gos_sheets: List[str] = []
-    gos_token = ""
-    if opt_gos and gos_sheets:
-        st.caption("Выбери листы «гос*» для обработки:")
-        for sh in gos_sheets:
-            pad, col1 = st.columns([1, 6])
-            with pad:
-                st.write("")
-            with col1:
-                on = st.checkbox(sh, value=False, key=f"gos_pick::{sh}")
-            if on:
-                selected_gos_sheets.append(sh)
-        gos_token = st.text_input(
-            "Токен API goszakup.gov.kz",
-            value="",
-            placeholder="Вставьте токен…",
-            type="password",
-            key="gos_token_input",
-        )
 
     opt_group_osv = st.checkbox("Объединить общие ОСВ по группе", value=False, disabled=(not group_osv_ok))
     if not group_osv_ok:
@@ -5310,7 +6297,7 @@ if "prepared_bytes" in st.session_state:
                 if st.checkbox(label, value=False, key=f"grp_pick::{suf}"):
                     selected_groups[suf] = sheets_in_group
 
-    # ── Объединение ОСВ по счёту (модуль 8) ─────────────────────────────
+    # ── Объединение ОСВ по счёту ─────────────────────────────────────────
     try:
         _tmp_wb8 = load_workbook(io.BytesIO(st.session_state["prepared_bytes"]), read_only=True)
         mergeable_osv: Dict[str, List[str]] = compute_mergeable_osv_from_wb(_tmp_wb8)
@@ -5329,7 +6316,6 @@ if "prepared_bytes" in st.session_state:
             "Порядок листов определяется автоматически по году в строке «Оборотно-сальдовая ведомость…»."
         )
 
-        # Читаем год конца периода для каждого ОСВ-листа
         _year_cache: Dict[str, Optional[int]] = {}
         try:
             _tmp_wb8b = load_workbook(io.BytesIO(st.session_state["prepared_bytes"]), read_only=True)
@@ -5365,6 +6351,19 @@ if "prepared_bytes" in st.session_state:
                         )
                     selected_merge_osv[acc] = sheets_by_year
 
+    opt_insights = st.checkbox("Инсайты", value=False, disabled=(not insights_ok))
+    if insights_existing:
+        st.warning("Инс уже есть в файле: " + ", ".join(insights_existing) + ". Повторно не генерирую.")
+    if insights_legacy:
+        st.caption("Найдены старые листы «инсайты» — при запуске будут переименованы в «инс» и перенесены в конец файла.")
+    if not insights_ok:
+        if insights_existing:
+            st.caption("Инс недоступен: для всех найденных префиксов лист «инс» уже существует.")
+        else:
+            st.caption("Инсайты недоступны: нужны листы W, M, Mt, Wt (лист «общ» — только для блока 6).")
+    elif insights_missing and insights_existing:
+        st.caption("Будут добавлены только отсутствующие: " + ", ".join(insights_missing) + ".")
+
     selected_modes: List[str] = []
     if opt_saldo:
         selected_modes.append("Сальдо")
@@ -5373,16 +6372,44 @@ if "prepared_bytes" in st.session_state:
     if opt_clients and selected_wt_sheets:
         selected_modes.append("Контрагенты")
 
+    # ── Динамический Bloomberg-топбар ──────────────────────────────────────
+    _tb_raw = ""
+    if analysis_u:
+        _tb_raw = re.sub(r'\.xlsx?$', '', analysis_u.name, flags=re.I)
+        _tb_raw = re.sub(r'^_Анализ[_\s]*', '', _tb_raw, flags=re.I).strip()
+        _tb_raw = re.sub(r'\b\d{12}\b', '', _tb_raw).strip()
+    elif analysis_title:
+        _tb_raw = re.sub(r'\b\d{12}\b', '', analysis_title).strip()
+    _tb_bin = next(
+        (_extract_client_bin(u.name or "") for u in uploads
+         if hasattr(u, "name") and _extract_client_bin(u.name or "")),
+        "",
+    )
+    _tb_mods: List[str] = []
+    if opt_profit:       _tb_mods.append("ЧП")
+    if opt_contracts:    _tb_mods.append("КОНТР")
+    if opt_saldo:        _tb_mods.append("САЛЬД")
+    if opt_inventory:    _tb_mods.append("ЗАП")
+    if opt_gos:          _tb_mods.append("ГОС")
+    if opt_clients:      _tb_mods.append("WT")
+    if opt_related:      _tb_mods.append("СВЯЗ")
+    if opt_group_osv:    _tb_mods.append("ГРУППА")
+    if opt_merge_osv:    _tb_mods.append("ОБЪЕД")
+    if opt_insights:     _tb_mods.append("ИНС")
+    topbar_ph.markdown(_render_topbar(_tb_raw, _tb_bin, _tb_mods or None), unsafe_allow_html=True)
+    # ───────────────────────────────────────────────────────────────────────
+
     st.write("")
     st.markdown("#### Запуск")
 
     clients_sel_ok = (not opt_clients) or bool(selected_wt_sheets)
     has_any_mode = (bool(selected_modes) or opt_inventory or opt_profit or opt_insights
                     or opt_gos or (opt_group_osv and bool(selected_groups))
-                    or (opt_merge_osv and bool(selected_merge_osv)))
+                    or (opt_merge_osv and bool(selected_merge_osv))
+                    or opt_related)
     inventory_ok = (not opt_inventory) or bool(inventory_accounts)
     profit_sel_ok = (not opt_profit) or bool(selected_obsh)
-    gos_sel_ok = (not opt_gos) or (bool(selected_gos_sheets) and bool(gos_token))
+    gos_sel_ok = (not opt_gos) or bool(selected_gos_sheets)
     group_osv_sel_ok = (not opt_group_osv) or bool(selected_groups)
     merge_osv_sel_ok = (not opt_merge_osv) or bool(selected_merge_osv)
     run_btn = st.button("Обработать", disabled=(
@@ -5459,6 +6486,21 @@ if "prepared_bytes" in st.session_state:
                 status_box.info("Обработка: Контрагенты (запросы к ГБД ЮЛ, может занять время)…")
                 progress.progress(99)
                 out_bytes = run_egov_clients_sheet(out_bytes, selected_wt_sheets)
+
+            if opt_related:
+                # Берём имя файла анализа (первый файл с "_анализ_" или 12 цифрами в имени)
+                _analysis_filename = ""
+                for _u in uploads:
+                    if "_анализ_" in (_u.name or "").lower() or re.search(r'\d{12}', _u.name or ""):
+                        _analysis_filename = _u.name or ""
+                        break
+                # Листы wt: выбранные пользователем, иначе все доступные
+                _rel_wt = selected_wt_sheets if selected_wt_sheets else wt_sheets_avail
+                status_box.info("Обработка: Связанные компании (ADATA + ГБД ЮЛ параллельно)…")
+                progress.progress(99)
+                out_bytes, _related_msg = run_related_companies_sheet(
+                    out_bytes, _rel_wt, _analysis_filename)
+                st.caption(f"Связанные: {_related_msg}")
 
             st.session_state["processed_bytes"] = out_bytes
             st.session_state["processed_name"] = st.session_state.get("prepared_name") or "output.xlsx"
